@@ -1,0 +1,150 @@
+{
+  "rmsnorm": {
+    "pytorch": [
+      {
+        "label": "B=1 T=1 H=3072",
+        "latency_ms": 0.0184,
+        "bandwidth_gb_s": 0.67,
+        "batch": 1,
+        "seq_len": 1,
+        "hidden": 3072,
+        "peak_bw_pct": 0.1
+      },
+      {
+        "label": "B=1 T=128 H=3072",
+        "latency_ms": 0.03,
+        "bandwidth_gb_s": 52.51,
+        "batch": 1,
+        "seq_len": 128,
+        "hidden": 3072,
+        "peak_bw_pct": 5.5
+      },
+      {
+        "label": "B=1 T=512 H=3072",
+        "latency_ms": 0.0444,
+        "bandwidth_gb_s": 141.56,
+        "batch": 1,
+        "seq_len": 512,
+        "hidden": 3072,
+        "peak_bw_pct": 14.7
+      },
+      {
+        "label": "B=1 T=2048 H=3072",
+        "latency_ms": 0.1226,
+        "bandwidth_gb_s": 205.21,
+        "batch": 1,
+        "seq_len": 2048,
+        "hidden": 3072,
+        "peak_bw_pct": 21.4
+      }
+    ]
+  },
+  "embedding_lookup": {
+    "pytorch": [
+      {
+        "label": "B=1 T=1 H=3072",
+        "latency_ms": 0.0044,
+        "bandwidth_gb_s": 1.39,
+        "batch": 1,
+        "seq_len": 1,
+        "hidden": 3072
+      },
+      {
+        "label": "B=1 T=128 H=3072",
+        "latency_ms": 0.0071,
+        "bandwidth_gb_s": 110.49,
+        "batch": 1,
+        "seq_len": 128,
+        "hidden": 3072
+      },
+      {
+        "label": "B=1 T=512 H=3072",
+        "latency_ms": 0.012,
+        "bandwidth_gb_s": 261.64,
+        "batch": 1,
+        "seq_len": 512,
+        "hidden": 3072
+      },
+      {
+        "label": "B=1 T=2048 H=3072",
+        "latency_ms": 0.0419,
+        "bandwidth_gb_s": 300.38,
+        "batch": 1,
+        "seq_len": 2048,
+        "hidden": 3072
+      }
+    ]
+  },
+  "output_projection": {
+    "pytorch": [
+      {
+        "label": "B=1 T=1 H=3072",
+        "latency_ms": 0.9207,
+        "bandwidth_gb_s": 856.2,
+        "batch": 1,
+        "seq_len": 1,
+        "hidden": 3072
+      },
+      {
+        "label": "B=1 T=128 H=3072",
+        "latency_ms": 1.0832,
+        "bandwidth_gb_s": 758.48,
+        "batch": 1,
+        "seq_len": 128,
+        "hidden": 3072
+      },
+      {
+        "label": "B=1 T=512 H=3072",
+        "latency_ms": 3.7802,
+        "bandwidth_gb_s": 244.03,
+        "batch": 1,
+        "seq_len": 512,
+        "hidden": 3072
+      },
+      {
+        "label": "B=1 T=2048 H=3072",
+        "latency_ms": 12.4808,
+        "bandwidth_gb_s": 106.24,
+        "batch": 1,
+        "seq_len": 2048,
+        "hidden": 3072
+      }
+    ]
+  },
+  "rope": {
+    "pytorch": [
+      {
+        "label": "B=1 T=1 H=128",
+        "latency_ms": 0.0264,
+        "bandwidth_gb_s": 0.64,
+        "batch": 1,
+        "seq_len": 1,
+        "head_dim": 128
+      },
+      {
+        "label": "B=1 T=128 H=128",
+        "latency_ms": 0.0338,
+        "bandwidth_gb_s": 63.9,
+        "batch": 1,
+        "seq_len": 128,
+        "head_dim": 128
+      },
+      {
+        "label": "B=1 T=512 H=128",
+        "latency_ms": 0.0543,
+        "bandwidth_gb_s": 159.36,
+        "batch": 1,
+        "seq_len": 512,
+        "head_dim": 128
+      },
+      {
+        "label": "B=1 T=2048 H=128",
+        "latency_ms": 0.1251,
+        "bandwidth_gb_s": 276.68,
+        "batch": 1,
+        "seq_len": 2048,
+        "head_dim": 128
+      }
+    ]
+  }
+}
