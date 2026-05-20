@@ -1,0 +1,116 @@
+{
+  "01_naive_engine": {
+    "description": "LlamaModel prefill only, no KV cache, no sampling. Real prompts.",
+    "max_seq_len": 256,
+    "workloads": [
+      {
+        "label": "1 seq  (B=1  \u00d71 )",
+        "n_total": 1,
+        "batch_size": 1,
+        "n_batches": 1,
+        "avg_seq_len": 53.0,
+        "avg_batch_ms": 22.33,
+        "total_wall_ms": 22.35,
+        "seqs_per_sec": 44.7,
+        "tokens_per_sec": 2371.6,
+        "peak_vram_gb": 6.62
+      },
+      {
+        "label": "8 seq  (B=8  \u00d71 )",
+        "n_total": 8,
+        "batch_size": 8,
+        "n_batches": 1,
+        "avg_seq_len": 70.0,
+        "avg_batch_ms": 40.08,
+        "total_wall_ms": 40.1,
+        "seqs_per_sec": 199.5,
+        "tokens_per_sec": 13966.0,
+        "peak_vram_gb": 6.88
+      },
+      {
+        "label": "24 seq (B=3  \u00d78 )",
+        "n_total": 24,
+        "batch_size": 3,
+        "n_batches": 8,
+        "avg_seq_len": 57.1,
+        "avg_batch_ms": 23.86,
+        "total_wall_ms": 190.87,
+        "seqs_per_sec": 125.7,
+        "tokens_per_sec": 7182.9,
+        "peak_vram_gb": 6.68
+      },
+      {
+        "label": "128 seq(B=16 \u00d78 )",
+        "n_total": 128,
+        "batch_size": 16,
+        "n_batches": 8,
+        "avg_seq_len": 68.0,
+        "avg_batch_ms": 72.77,
+        "total_wall_ms": 582.22,
+        "seqs_per_sec": 219.8,
+        "tokens_per_sec": 14949.7,
+        "peak_vram_gb": 7.15
+      },
+      {
+        "label": "1024seq(B=32 \u00d732)",
+        "n_total": 1024,
+        "batch_size": 32,
+        "n_batches": 32,
+        "avg_seq_len": 47.0,
+        "avg_batch_ms": 100.47,
+        "total_wall_ms": 3215.21,
+        "seqs_per_sec": 318.5,
+        "tokens_per_sec": 14968.8,
+        "peak_vram_gb": 7.37
+      },
+      {
+        "label": "2048seq(B=32 \u00d764)",
+        "n_total": 2048,
+        "batch_size": 32,
+        "n_batches": 64,
+        "avg_seq_len": 60.0,
+        "avg_batch_ms": 125.88,
+        "total_wall_ms": 8056.35,
+        "seqs_per_sec": 254.2,
+        "tokens_per_sec": 15252.6,
+        "peak_vram_gb": 7.59
+      },
+      {
+        "label": "4096seq(B=64 \u00d764)",
+        "n_total": 4096,
+        "batch_size": 64,
+        "n_batches": 64,
+        "avg_seq_len": 105.0,
+        "avg_batch_ms": 446.01,
+        "total_wall_ms": 28544.75,
+        "seqs_per_sec": 143.5,
+        "tokens_per_sec": 15066.9,
+        "peak_vram_gb": 10.08
+      },
+      {
+        "label": "8192seq(B=128\u00d764)",
+        "n_total": 8192,
+        "batch_size": 128,
+        "n_batches": 64,
+        "avg_seq_len": 80.0,
+        "avg_batch_ms": 732.37,
+        "total_wall_ms": 46872.25,
+        "seqs_per_sec": 174.8,
+        "tokens_per_sec": 13981.8,
+        "peak_vram_gb": 11.91
+      },
+      {
+        "label": "16384seq(B=256\u00d764)",
+        "n_total": 16384,
+        "batch_size": 256,
+        "n_batches": 64,
+        "avg_seq_len": 79.0,
+        "avg_batch_ms": 1424.68,
+        "total_wall_ms": 91180.22,
+        "seqs_per_sec": 179.7,
+        "tokens_per_sec": 14195.4,
+        "peak_vram_gb": 17.09
+      }
+    ]
+  }
+}
