@@ -45,7 +45,9 @@ We map these to shorter names used throughout our own code:
 
 from __future__ import annotations
 
+import env_loader
 import json
+import os
 import re
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Tuple
@@ -164,6 +166,7 @@ class WeightLoader:
         caches to ~/.cache/huggingface/hub/.
         """
         print(f"Locating model: {repo_id}")
+        token = token or os.environ.get("HF_TOKEN")
         local_dir = snapshot_download(
             repo_id=repo_id,
             cache_dir=cache_dir,

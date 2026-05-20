@@ -7,6 +7,7 @@ anywhere else in the codebase.
 
 from __future__ import annotations
 
+import env_loader
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
