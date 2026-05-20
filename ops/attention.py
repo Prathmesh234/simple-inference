@@ -114,6 +114,9 @@ class GroupedQueryAttention(nn.Module):
         q = q.view(B, T, self.num_heads_q,  self.head_dim)
         k = k.view(B, T, self.num_heads_kv, self.head_dim)
         v = v.view(B, T, self.num_heads_kv, self.head_dim)
+        print(f"Q shape - {q.shape}")
+        print(f"K shape - {k.shape}")
+        print(f"V shape - {v.shape}")
 
         # --- 3. Apply RoPE to Q and K ---
         cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos)
@@ -125,6 +128,9 @@ class GroupedQueryAttention(nn.Module):
         q = q.transpose(1, 2)  # (B, n_heads_q,  T, head_dim)
         k = k.transpose(1, 2)  # (B, n_heads_kv, T, head_dim)
         v = v.transpose(1, 2)  # (B, n_heads_kv, T, head_dim)
+        print(f"Q shape post transpose - {q.shape}")
+        print(f"K shape post transpose - {k.shape}")
+        print(f"V shape post transpose - {v.shape}")
 
         # --- 5. KV cache update (no-op until Section 11) ---
         if kv_cache is not None:
