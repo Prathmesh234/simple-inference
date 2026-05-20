@@ -18,7 +18,7 @@ from config import ModelConfig
 from loader import WeightLoader
 from ops.rope import RopeFrequencies
 from ops.attention import GroupedQueryAttention
-from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, record, print_results
+from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, tensor_core_util_pct, record, print_results
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
@@ -77,8 +77,10 @@ def check_correctness(loader: WeightLoader, cfg: ModelConfig):
     position_ids = torch.arange(T, device=DEVICE).unsqueeze(0)
 
     with torch.no_grad():
+        ref_rope = ref_model.model.rotary_emb
+        position_embeddings = ref_rope(x.transpose(1, 2), position_ids)
         our_out = attn(x, start_pos=0)
-        ref_out, _, _ = ref_attn(x, position_ids=position_ids)
+        ref_out = ref_attn(x, position_embeddings=position_embeddings)[0]
 
     diff = (our_out - ref_out).abs().max().item()
     mean_diff = (our_out - ref_out).abs().mean().item()
@@ -142,8 +144,8 @@ def run_benchmarks(cfg: ModelConfig):
 
     PEAK_BW = 960.0
 
-    print(f"  {'Config':<24} {'Latency':>10}  {'Bandwidth':>12}  {'% of peak':>10}")
-    print(f"  {'-'*24} {'-'*10}  {'-'*12}  {'-'*10}")
+    print(f"  {'Config':<24} {'Latency':>10}  {'BW GB/s':>10}  {'BW%peak':>8}  {'TC%peak':>8}")
+    print(f"  {'-'*24} {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}")
 
     for label, B, T in shapes:
         x = torch.randn(B, T, cfg.hidden_size, device=DEVICE, dtype=DTYPE)
@@ -153,14 +155,27 @@ def run_benchmarks(cfg: ModelConfig):
         act_bytes = B * T * cfg.hidden_size * 2 * 2  # read x + write out
         bytes_moved = weight_bytes + act_bytes
 
+        # FLOPs: 4 projection matmuls + QK^T + softmax@V
+        proj_flops = 2 * B * T * (
+            cfg.num_attention_heads  * cfg.head_dim * cfg.hidden_size  # wq
+            + cfg.num_key_value_heads * cfg.head_dim * cfg.hidden_size  # wk
+            + cfg.num_key_value_heads * cfg.head_dim * cfg.hidden_size  # wv
+            + cfg.num_attention_heads * cfg.head_dim * cfg.hidden_size  # wo
+        )
+        # QK^T: (B, nH, T, d) @ (B, nH, d, T) = 2*B*nH*T*T*d each direction
+        attn_flops = 2 * 2 * B * cfg.num_attention_heads * T * T * cfg.head_dim
+        flops = proj_flops + attn_flops
+
         lat_ms = bench_fn(lambda: attn(x, start_pos=0))
         bw     = bandwidth_gb_s(bytes_moved, lat_ms)
-        pct    = bw / PEAK_BW * 100
+        bw_pct = bw / PEAK_BW * 100
+        tc_pct = tensor_core_util_pct(flops, lat_ms)
 
         short = f"B={B} T={T} H={cfg.hidden_size}"
-        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f} GB/s  {pct:>9.1f}%")
+        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f}  {bw_pct:>7.1f}%  {tc_pct:>7.1f}%")
         record("attention", "pytorch", short, lat_ms, bw,
-               extra={"batch": B, "seq_len": T, "hidden": cfg.hidden_size})
+               extra={"batch": B, "seq_len": T, "hidden": cfg.hidden_size,
+                      "tc_util_pct": round(tc_pct, 1)})
 
 
 # ---------------------------------------------------------------------------
