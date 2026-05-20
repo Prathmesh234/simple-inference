@@ -36,6 +36,7 @@ Why the vocab is 128,256 and not a round number:
 
 from __future__ import annotations
 
+import env_loader
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -60,6 +61,8 @@ class Tokenizer:
     @classmethod
     def from_pretrained(cls, repo_id: str, token: Optional[str] = None) -> Tokenizer:
         """Load tokenizer directly from HuggingFace Hub (no weights needed)."""
+        import os
+        token = token or os.environ.get("HF_TOKEN")
         obj = object.__new__(cls)
         obj._tok = AutoTokenizer.from_pretrained(repo_id, use_fast=True, token=token)
         return obj
