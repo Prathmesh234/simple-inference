@@ -19,7 +19,7 @@ from transformers import AutoModelForCausalLM
 from config import ModelConfig
 from loader import WeightLoader
 from ops.embedding import TokenEmbedding, OutputProjection
-from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, record, print_results
+from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, tensor_core_util_pct, record, print_results
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
@@ -41,7 +41,7 @@ def check_correctness(loader: WeightLoader, cfg: ModelConfig):
     # Load reference model
     print("  Loading transformers model for reference...")
     ref_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=DTYPE, device_map=DEVICE,
+        MODEL_ID, dtype=DTYPE, device_map=DEVICE, token=os.environ.get("HF_TOKEN"),
     )
     ref_model.eval()
     ref_embed = ref_model.model.embed_tokens
@@ -110,27 +110,31 @@ def run_benchmarks(cfg: ModelConfig):
 
     # TokenEmbedding benchmark
     print(f"\n  TokenEmbedding  (vocab={cfg.vocab_size}, hidden={cfg.hidden_size})")
-    print(f"  {'Config':<24} {'Latency':>10}  {'Bandwidth':>12}  {'% of peak':>10}")
-    print(f"  {'-'*24} {'-'*10}  {'-'*12}  {'-'*10}")
+    print(f"  {'Config':<24} {'Latency':>10}  {'BW GB/s':>10}  {'BW%peak':>8}  {'TC%peak':>8}")
+    print(f"  {'-'*24} {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}")
 
     for label, B, T in shapes:
         token_ids = torch.randint(0, cfg.vocab_size, (B, T), device=DEVICE)
         # Bytes: reading T rows of hidden_size bfloat16 values from the table
         bytes_moved = B * T * cfg.hidden_size * 2
 
+        # Embedding is a pure memory gather — no FLOPs (no multiply-accumulate)
+        flops = 0
+
         lat_ms = bench_fn(lambda: embed(token_ids))
         bw     = bandwidth_gb_s(bytes_moved, lat_ms)
-        pct    = bw / PEAK_BW * 100
+        bw_pct = bw / PEAK_BW * 100
+        tc_pct = tensor_core_util_pct(flops, lat_ms) if flops > 0 else 0.0
 
         short = f"B={B} T={T} H={cfg.hidden_size}"
-        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f} GB/s  {pct:>9.1f}%")
+        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f}  {bw_pct:>7.1f}%  {'n/a':>8}")
         record("embedding_lookup", "pytorch", short, lat_ms, bw,
                extra={"batch": B, "seq_len": T, "hidden": cfg.hidden_size})
 
     # OutputProjection benchmark
     print(f"\n  OutputProjection  (hidden={cfg.hidden_size} → vocab={cfg.vocab_size})")
-    print(f"  {'Config':<24} {'Latency':>10}  {'Bandwidth':>12}  {'% of peak':>10}")
-    print(f"  {'-'*24} {'-'*10}  {'-'*12}  {'-'*10}")
+    print(f"  {'Config':<24} {'Latency':>10}  {'BW GB/s':>10}  {'BW%peak':>8}  {'TC%peak':>8}")
+    print(f"  {'-'*24} {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}")
 
     for label, B, T in shapes:
         x = torch.randn(B, T, cfg.hidden_size, device=DEVICE, dtype=DTYPE)
@@ -141,14 +145,19 @@ def run_benchmarks(cfg: ModelConfig):
             + B * T * cfg.vocab_size * 2         # write logits
         )
 
+        # FLOPs: one matmul (B*T, hidden) @ (hidden, vocab)
+        flops = 2 * B * T * cfg.hidden_size * cfg.vocab_size
+
         lat_ms = bench_fn(lambda: proj(x))
         bw     = bandwidth_gb_s(bytes_moved, lat_ms)
-        pct    = bw / PEAK_BW * 100
+        bw_pct = bw / PEAK_BW * 100
+        tc_pct = tensor_core_util_pct(flops, lat_ms)
 
         short = f"B={B} T={T} H={cfg.hidden_size}"
-        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f} GB/s  {pct:>9.1f}%")
+        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f}  {bw_pct:>7.1f}%  {tc_pct:>7.1f}%")
         record("output_projection", "pytorch", short, lat_ms, bw,
-               extra={"batch": B, "seq_len": T, "hidden": cfg.hidden_size})
+               extra={"batch": B, "seq_len": T, "hidden": cfg.hidden_size,
+                      "tc_util_pct": round(tc_pct, 1)})
 
 
 # ---------------------------------------------------------------------------
