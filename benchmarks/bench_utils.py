@@ -35,6 +35,10 @@ RESULTS_DIR = Path(__file__).parent
 BASELINE_FILE = RESULTS_DIR / "results_baseline.json"
 TRITON_FILE   = RESULTS_DIR / "results_triton.json"
 
+# RTX 6000 Ada hardware ceilings
+PEAK_BW_GB_S       = 960.0    # GB/s  memory bandwidth
+PEAK_TFLOPS_BF16   = 1457.0   # TFLOPS bf16 tensor-core throughput
+
 
 # ---------------------------------------------------------------------------
 # Core timing primitive
@@ -57,6 +61,26 @@ def bench_fn(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
 def bandwidth_gb_s(bytes_moved: int, latency_ms: float) -> float:
     """Convert bytes moved + latency to GB/s."""
     return bytes_moved / (latency_ms * 1e-3) / 1e9
+
+
+def tensor_core_util_pct(flops: int, latency_ms: float) -> float:
+    """
+    Return achieved tensor-core utilisation as % of peak BF16 throughput.
+
+    flops      : total floating-point operations for one kernel call
+                 (multiply-adds count as 2 FLOPs each)
+    latency_ms : median kernel time from bench_fn()
+
+    Formula:
+        achieved TFLOPS = flops / latency_s / 1e12
+        util %          = achieved / peak * 100
+
+    Interpretation:
+        High %  → compute-bound  (tensor cores are the bottleneck)
+        Low  %  → memory-bound   (memory bus is the bottleneck, TC sit idle)
+    """
+    achieved_tflops = flops / (latency_ms * 1e-3) / 1e12
+    return achieved_tflops / PEAK_TFLOPS_BF16 * 100
 
 
 # ---------------------------------------------------------------------------
