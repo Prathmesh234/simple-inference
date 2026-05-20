@@ -16,7 +16,7 @@ from transformers import AutoModelForCausalLM
 
 from config import ModelConfig
 from ops.rope import RopeFrequencies, apply_rope
-from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, record, print_results
+from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, tensor_core_util_pct, record, print_results
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
@@ -122,8 +122,8 @@ def run_benchmarks(cfg: ModelConfig):
 
     PEAK_BW = 960.0
 
-    print(f"  {'Config':<24} {'Latency':>10}  {'Bandwidth':>12}  {'% of peak':>10}")
-    print(f"  {'-'*24} {'-'*10}  {'-'*12}  {'-'*10}")
+    print(f"  {'Config':<24} {'Latency':>10}  {'BW GB/s':>10}  {'BW%peak':>8}  {'TC%peak':>8}")
+    print(f"  {'-'*24} {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}")
 
     for label, B, T in shapes:
         q = torch.randn(B, T, cfg.num_attention_heads, cfg.head_dim, device=DEVICE, dtype=DTYPE)
@@ -139,14 +139,20 @@ def run_benchmarks(cfg: ModelConfig):
         nc = T * cfg.head_dim
         bytes_moved = (nq + nk + nc + nc + nq + nk) * 2  # bfloat16
 
+        # FLOPs: RoPE rotates pairs of elements with 4 mults + 2 adds = 6 FLOPs/element
+        # Applied to Q (nq elements) and K (nk elements)
+        flops = 6 * (nq + nk)
+
         lat_ms = bench_fn(lambda: apply_rope(q, k, cos, sin))
         bw     = bandwidth_gb_s(bytes_moved, lat_ms)
-        pct    = bw / PEAK_BW * 100
+        bw_pct = bw / PEAK_BW * 100
+        tc_pct = tensor_core_util_pct(flops, lat_ms)
 
         short = f"B={B} T={T} H={cfg.head_dim}"
-        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f} GB/s  {pct:>9.1f}%")
+        print(f"  {label:<24} {lat_ms:>9.4f}ms  {bw:>10.1f}  {bw_pct:>7.1f}%  {tc_pct:>7.1f}%")
         record("rope", "pytorch", short, lat_ms, bw,
-               extra={"batch": B, "seq_len": T, "head_dim": cfg.head_dim})
+               extra={"batch": B, "seq_len": T, "head_dim": cfg.head_dim,
+                      "tc_util_pct": round(tc_pct, 1)})
 
 
 # ---------------------------------------------------------------------------
