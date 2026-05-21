@@ -29,6 +29,15 @@
 
 ## Two-phase approach
 
+> **Big picture.** Everything in Sections 1–21 is the **software phase** — one
+> GPU, one process, every optimization is something you do *inside* the engine.
+> Section 22 onward is **Phase 2 — Multi-GPU Serving**: we cross a NIC, split
+> prefill from decode, and rebuild the engine as a prefill-decode disaggregated
+> system with a hand-rolled RDMA transport. The numbered sub-phases below
+> (Phase 1, 2, 3 PyTorch/Triton/Serving) are internal *tracks* of the software
+> phase; the top-level **Phase 2 — Multi-GPU Serving** lives at the end of this
+> doc and is the hardware chapter of the project.
+
 ### Phase 1 — Pure PyTorch baseline (Sections 1–13)
 Build every component in plain PyTorch with no custom kernels. Goal is a working, correct inference engine. Every section ends with:
 1. A numerical correctness check against `transformers`
@@ -704,6 +713,112 @@ capture/replay semantics, why static shapes + static memory are the cost of admi
 
 ---
 
+## Section 20 — Speculative Decoding  *(draft + verify)*
+
+**Builds on:** Section 15 (continuous batching). Works on top of any KV-cache
+flavor (Section 11 / 16) and composes with chunked prefill and CUDA graphs.
+
+**Files:** `serving/spec_decode.py`, modify decode path in `serving/engine.py`
+
+**Problem it solves**
+Decode is memory-bound: the GPU spends most of its time loading the 3B weights
+to produce one token. The matmul itself finishes long before the next set of
+weights arrives. If we could verify *k* candidate tokens per forward pass at
+the cost of one weight load, we'd amortize that load over *k* tokens.
+
+**Solution: draft model proposes, target model verifies**
+- A small **draft model** (e.g., a 0.5B-parameter Llama or an *n*-gram model
+  built from the prompt) cheaply generates *k* candidate next tokens
+- The target model runs **one** forward pass on those *k* tokens in parallel,
+  producing the target distribution at each candidate position
+- Accept the longest prefix where target and draft agree (under the chosen
+  sampling rule); resample at the first disagreement
+- Worst case: one accepted token per target step (same as no spec decoding).
+  Best case: *k* tokens per target step.
+
+```python
+class Drafter:
+    # tiny model OR n-gram lookup table built from the request's own context
+    def propose(prefix_tokens, k) -> list[int]: ...
+
+class SpecDecodeEngine:
+    target: LlamaModel
+    drafter: Drafter
+    def step(req) -> list[int]:
+        drafts = self.drafter.propose(req.tokens, K)
+        target_logits = self.target.forward_parallel(req.tokens + drafts)
+        return verify_and_resample(drafts, target_logits, req.sampler)
+```
+
+**Steps**
+- Start with **prompt-lookup n-gram drafter** (zero training cost, surprising hit rate on repetitive workloads — code/chat replies)
+- Then a real small draft model (Llama 3.2-1B as drafter for Llama 3.2-3B target)
+- Implement rejection sampling that preserves the target's output distribution
+- Verify generated text is statistically identical to non-spec sampling at same seed (per-token distributions match)
+
+**Benchmark workload (add as #10):**
+Repetitive-ish workload (code completion, JSON output, long boilerplate replies) — these are where spec decode wins hardest.
+
+**Expected win:**
+- 1.5-3× decode tokens/sec on workloads with predictable continuations
+- Slowdown of 1.05-1.1× on adversarial low-acceptance workloads (overhead of drafter + parallel verify)
+- Acceptance rate is the headline metric — track it per workload
+
+**Learned:** why memory-bound decode leaves FLOPS on the table, how rejection
+sampling preserves the target distribution, why draft quality (acceptance rate) is the
+only thing that matters.
+
+---
+
+## Section 21 — Weight-only Quantization  *(FP8 / INT8)*
+
+**Builds on:** Phase 1 model. Composes with everything in Phase 3.
+
+**Files:** `quant/quantizer.py`, `quant/qlinear.py`, `kernels/dequant_matmul.py`
+
+**Problem it solves**
+Llama 3.2-3B in BF16 is ~6 GB of weights. At decode time we read all of them
+to produce a single token — memory bandwidth (960 GB/s on RTX 6000 Ada) is the
+ceiling. Halve the bytes-per-weight, halve the load time → ~2× decode
+throughput essentially for free, *if* dequant fits in the matmul kernel.
+
+**Solution: store weights in INT8/FP8, dequantize in-kernel**
+- Quantize each linear layer's weight matrix to INT8 (or FP8 if hardware supports)
+- Store one **scale** per output channel (or per group of K input channels for AWQ-style)
+- Activations stay in BF16 — this is *weight-only* quantization, the simplest variant
+- Custom matmul kernel: load INT8 weight tile, dequantize to BF16 in registers,
+  multiply by BF16 activation tile, accumulate in FP32
+
+```python
+class QLinear(nn.Module):
+    qweight:  torch.Tensor   # int8, shape (out, in)
+    scales:   torch.Tensor   # bf16, shape (out,) or (out, in/group)
+    def forward(x):  # x is bf16
+        return dequant_matmul(x, self.qweight, self.scales)   # Triton kernel
+```
+
+**Steps**
+- Per-channel symmetric INT8 quantization (offline, one-shot)
+- Verify per-layer output MSE stays under threshold (~1e-3 vs BF16)
+- Write a Triton dequant+matmul kernel — fuse the dequant into the matmul to avoid materializing BF16 weights
+- Swap `QLinear` into attention's W_q/W_k/W_v/W_o and MLP's W_gate/W_up/W_down
+- Run perplexity check on a small eval set to confirm no quality regression
+
+**Benchmark:**
+- Decode throughput before/after quant at the standard workloads
+- Peak VRAM (should drop ~3 GB)
+- Acceptance test: full-text identical-or-near-identical generation at temperature 0
+
+**Expected win:**
+- 1.5-1.8× decode throughput (limited by how cleanly the dequant fuses into matmul)
+- 2× lower weight memory → more KV cache budget → more concurrent requests
+- Minor quality drop (perplexity within ~1%)
+
+**Learned:** memory bandwidth as the ceiling for decode, why weight-only quant
+is the simplest "free" optimization, where dequant fusion belongs in the kernel.
+
+---
+
 ## Build Order Summary
 
 ```
@@ -729,12 +844,18 @@ Phase 2 — Triton kernels (swap in one at a time)
   Section 14d    kernels/attention_kernel.py
   Section 14e    final benchmark comparison
 
-Phase 3 — Serving optimizations (multi-request)
+Phase 3 — Serving optimizations (multi-request, still single GPU)
   Section 15     serving/scheduler.py        continuous batching
   Section 16     serving/paged_kv_cache.py   PagedAttention
   Section 17     serving/radix_cache.py      RadixAttention / prefix caching
   Section 18     serving/scheduler.py (mod)  chunked prefill
   Section 19     serving/cuda_graph_pool.py  CUDA graphs for decode
+  Section 20     serving/spec_decode.py      speculative decoding (draft+verify)
+  Section 21     quant/qlinear.py            weight-only INT8/FP8 quantization
+
+(Software phase ends here. Multi-GPU / RDMA chapter — Phase 2 in the
+ software→hardware split — is laid out separately at the bottom of this doc,
+ Sections 22–28.)
 ```
 
 ---
@@ -780,6 +901,20 @@ iterations/
                                  │
   11_chunked_prefill.py         + chunked prefill scheduling (Section 18) — built on 09 (the main path)
   12_cuda_graphs.py             + CUDA graphs for decode (Section 19) — built on 11
+  13_spec_decode.py             + speculative decoding (Section 20) — built on 12
+  14_quantization.py            + weight-only INT8 quantization (Section 21) — built on 13
+
+(Iterations 15+ live in the hardware chapter; they require rented multi-GPU
+ boxes so they're tracked separately under Phase 2 — see Sections 22–28.)
+
+  ── Phase 2 — Multi-GPU Serving (separate iteration track, hardware) ──
+  disagg/15_disagg_local.py       Section 22  prefill/decode split, no RDMA
+  disagg/16_rdma_loopback.py      Section 24  one H100, GPUDirect RDMA loopback
+  disagg/17_mrc_transport.py      Section 25  mini libibverbs transport
+  disagg/18_two_gpu_disagg.py     Section 26  2×H100 NIC↔NIC prefill→decode
+  disagg/19_rdma_opt_multiqp.py   Section 27a multi-QP striping
+  disagg/20_rdma_opt_pipeline.py  Section 27f layer-pipelined KV transfer
+  disagg/21_disagg_scheduler.py   Section 28  disagg-aware scheduler
 ```
 
 **Why 09 and 10 fork from 08 independently:** PagedAttention and RadixAttention
@@ -809,6 +944,10 @@ across **all** iterations.
 - **Compare 09 vs 10 head-to-head** on workloads #6, #7, #8 — paged dominates max-concurrency, radix dominates shared-prefix
 - `09 → 11`: p95/p99 tail latency drops 30-50% under load
 - `11 → 12`: small-batch decode latency drops 1.5-2× from killing launch overhead
+- `12 → 13`: decode tokens/sec up 1.5-3× on repetitive workloads; acceptance rate is the headline
+- `13 → 14`: peak VRAM drops ~3 GB, decode tokens/sec up ~1.5-1.8×, perplexity within ~1%
+- `14 → disagg/*`: now we're on multi-GPU hardware; the question shifts from
+  "tokens/sec per GPU" to "tokens/sec per fabric byte" and "goodput at SLO"
 
 ---
 
@@ -826,10 +965,380 @@ across **all** iterations.
 ## What This Is NOT
 
 - Not flash-attention (we study it, then optionally write it in Section 14d)
-- Not quantization (INT4/AWQ/GPTQ/FP8)
-- Not speculative decoding (Medusa, EAGLE, draft+verify)
-- Not multi-GPU (tensor / pipeline / sequence parallelism)
+- Not INT4/AWQ/GPTQ quantization (we cover weight-only INT8/FP8 in Section 21)
+- Not Medusa / EAGLE tree-style speculative decoding (we cover draft-and-verify in Section 20)
+- Not tensor / pipeline / sequence parallelism (orthogonal to the disagg multi-GPU work in Phase 2)
 - Not structured outputs (JSON schema constrained decoding)
-- Not disaggregated prefill/decode serving
 
-All natural next steps once you understand Phases 1-3.
+---
+
+# Phase 2 — Multi-GPU Serving  *(prefill-decode disaggregation, hardware chapter)*
+
+> Up to here we've been on a single GPU in a single process. Phase 2 splits the
+> engine across machines and rebuilds it as **prefill-decode disaggregated**
+> from the start. Prefill workers do the compute-heavy initial pass; decode
+> workers stream tokens. Between them, the KV cache travels over an **RDMA
+> fabric** — and once bytes cross a NIC you discover a whole new performance
+> regime: PCIe vs NVLink, IB verbs, queue pairs, completion queues, single-QP
+> congestion. We hand-roll the transport with libibverbs, take it through
+> loopback and then real NIC↔NIC, and apply the optimizations production
+> engines (DeepSeek's PD-disagg, SGLang's prefill-decode split,
+> NVIDIA Dynamo / NIXL, Mooncake) actually use.
+>
+> **Why disaggregation:** prefill is compute-bound (large matmuls over the
+> whole prompt), decode is memory-bound (one weight-load per token). Co-locating
+> them on the same GPU means each pass leaves one resource idle. Splitting
+> them lets each role run on hardware tuned for it — and lets prefill and
+> decode scale independently. The catch: you now have to move ~`n_layers × 2
+> × tokens × kv_heads × head_dim` bytes of KV cache from prefill GPU to decode
+> GPU per request, fast.
+
+## Hardware ladder for this phase
+
+You don't need a full cluster to learn this — rent step-by-step from
+[Prime Intellect](https://www.primeintellect.ai) or a similar marketplace:
+
+| Step | Hardware | Approx cost | What you learn |
+|------|----------|-------------|----------------|
+| 0    | Local dev box, no IB | $0 | Read NCCL's `src/transport/net_ib.cc`, libibverbs man pages, sketch the API on CPU |
+| 1    | **One H100 + ConnectX NIC** | ~$2/hr | GPUDirect RDMA in **loopback** — same NIC sends from GPU HBM and receives back into GPU HBM. Run `nccl-tests` with `NCCL_DEBUG=INFO` and watch verbs negotiate. |
+| 2    | **Two H100s on one node** (2-GPU box) | ~$4/hr | Real NIC↔NIC path through the node's switch. Run 2-rank NCCL all-reduce, watch a single QP saturate and feel why multi-rail / MRC matters. |
+| 3    | Two H100s, **two separate nodes** (optional, later) | ~$8/hr | True cross-host RDMA + congestion across a fabric. Only needed once your single-node disagg works. |
+
+> **MRC** = Multi-Rail Channel; the idea that one QP can't saturate a modern
+> NIC and that traffic should be striped across multiple QPs (and ideally
+> multiple physical rails) for both bandwidth and congestion isolation. NCCL's
+> `net_ib.cc` is the file in the wild that we'll either patch or shadow with
+> our own transport.
+
+---
+
+## Section 22 — Prefill/Decode Disaggregation Architecture
+
+**Files:** `serving/disagg/roles.py`, `serving/disagg/protocol.py`, `serving/disagg/engine.py`
+
+**Goal**
+Refactor the Section 15 engine into two independent processes (eventually two
+machines): a **PrefillWorker** and a **DecodeWorker**, plus a **Router** that
+admits requests, picks a prefill worker, then hands the request (plus its KV
+location) to a decode worker.
+
+```python
+class PrefillWorker:
+    model: LlamaModel
+    kv_pool: PagedKVCache            # local
+    def run(req) -> KVHandle:        # tokenize → prefill → return remote handle
+        kv = self.kv_pool.alloc(req.prompt_tokens)
+        self.model.prefill_into(kv, req.prompt_tokens)
+        return KVHandle(addr=kv.base_ptr, len=kv.nbytes, rkey=kv.rkey)
+
+class DecodeWorker:
+    model: LlamaModel
+    kv_pool: PagedKVCache            # local
+    transport: KVTransport           # RDMA, Section 25
+    def admit(req, remote_kv: KVHandle):
+        local = self.kv_pool.alloc_for(req)
+        self.transport.rdma_read(local.ptr, remote_kv)   # pull KV from prefill worker
+        self.scheduler.add(req, local)
+
+class Router:
+    prefill: list[PrefillWorker]
+    decode:  list[DecodeWorker]
+    def submit(req): ...             # FIFO across prefill, least-loaded decode
+```
+
+**KV transfer modes (pick one to start, support both later)**
+- **Pull (decode reads):** decode worker issues RDMA READ from prefill worker's HBM. Simpler flow control. What we'll start with.
+- **Push (prefill writes):** prefill worker issues RDMA WRITE into decode worker's HBM. Lower decode-side latency, harder backpressure.
+
+**Steps**
+- Define the on-wire request/response messages (protobuf or hand-rolled struct over TCP for the control plane)
+- Move all decode logic into `DecodeWorker`; prefill logic into `PrefillWorker`
+- Initially run both as threads in one process, sharing CUDA context, *no RDMA yet* — just `cudaMemcpy` for the KV blob to prove the protocol
+- Then split into two processes on the same GPU via CUDA IPC
+- Verify a request flowing prefill→decode still produces the same tokens as the integrated Section 15 engine
+
+**Expected win:** none yet — the win comes from independent scaling and from
+hardware-specific tuning (prefill GPUs at full FLOPS, decode GPUs at high
+batch + small weights). What we want is the **decoupling**, so that Sections
+23–28 can land bytes on the right GPU at line rate.
+
+**Learned:** roles vs ops, KV cache as a first-class object that travels, why
+disagg is harder than it sounds (control plane, scheduling, backpressure).
+
+---
+
+## Section 23 — NCCL Baseline + IB Verbs Transport Observation
+
+**Hardware:** Step 1 above — one H100 + ConnectX NIC on Prime Intellect.
+
+**Goal**
+Before writing any RDMA code, observe a real consumer of libibverbs (NCCL)
+end-to-end. Build the mental model of QPs, MRs, CQs, and the verbs handshake.
+
+**Steps**
+- Install NCCL + nccl-tests on the H100 node
+- Run `all_reduce_perf -b 8 -e 1G -f 2 -g 1` (single-GPU loopback) with
+  `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ALL` — read every line of the negotiation:
+  - which net plugin loaded (`NET/IB`)
+  - which device (`mlx5_0`, `mlx5_1`)
+  - which transport (`P2P/IPC` vs `NET/IB`)
+  - which protocol (`Simple` vs `LL128`)
+- Force IB by `NCCL_NET=IB` and confirm GPUDirect RDMA path: NIC reads from
+  GPU HBM, sends a packet out, the same NIC receives it, writes back into GPU
+  HBM. Confirm via `ibstat`, `perfquery`, and `nvidia-smi nvlink`.
+- Read NCCL's `src/transport/net_ib.cc` line by line:
+  - QP setup (`ncclIbCreateQp`)
+  - MR registration (`ncclIbRegMr`)
+  - WR posting (`ncclIbIsend` / `ncclIbIrecv`)
+  - Completion polling (`ncclIbTest`)
+
+**Deliverable**
+`docs/nccl_verbs_walkthrough.md` — annotated copies of the relevant net_ib
+functions, mapped to libibverbs man pages. This is the spec for what we build
+in Section 25.
+
+**Learned:** what a verbs transport actually looks like in a real library,
+which IB primitives matter for KV transfer, where GPUDirect RDMA enters the path.
+
+---
+
+## Section 24 — GPUDirect RDMA Loopback
+
+**Hardware:** Same one H100 node.
+
+**Goal**
+Write the smallest possible C/C++ program (compiled into a Python extension
+via ctypes/pybind11) that:
+1. Allocates a buffer on GPU HBM (`cudaMalloc`)
+2. Registers it as an IB memory region (`ibv_reg_mr` with the GPU address)
+3. Creates one RC QP, connects it to itself (loopback)
+4. Posts an `IBV_WR_RDMA_WRITE` from the GPU buffer to another GPU buffer on the same device
+5. Polls the completion queue
+6. Confirms the destination buffer changed
+
+This isolates **GPUDirect RDMA** — the NIC DMA-ing in and out of GPU HBM
+directly, bypassing the CPU — without any of the distributed-systems noise.
+
+**Steps**
+- `nv_peer_mem` / `gdrcopy` setup on the host; verify with NVIDIA's `gdrcopy_sanity`
+- ctypes wrapper around libibverbs (`infiniband/verbs.h`)
+- Loopback QP setup: bring local QP through `INIT → RTR → RTS` with itself as the remote
+- Single 1 MB RDMA WRITE; assert bytes match; measure latency and bandwidth
+- Sweep message sizes 4 KB → 64 MB, plot the bandwidth curve (the "knee" tells you about MTU and doorbell overhead)
+
+**Caveats**
+- ConnectX NIC must be on the same PCIe root complex as the GPU for GPUDirect RDMA to actually go peer-to-peer. `nvidia-smi topo -m` will tell you. If it goes via host memory, bandwidth is capped at ~half of expected.
+- Verify with `mlxconfig` that `ADVANCED_PCI_SETTINGS=1` and ATS settings are sane on the host.
+
+**Expected numbers:** ~25–40 GB/s for 1 MB+ writes on a 200 Gb/s ConnectX-7 once you escape PCIe overhead.
+
+**Learned:** the actual byte path NIC↔HBM, registration cost amortization,
+why message size matters more than you'd think.
+
+---
+
+## Section 25 — Mini RDMA Transport Library (`mrc.h`-style)
+
+**Hardware:** Same one H100 node — still loopback.
+
+**Files:** `transport/rdma/` — a small C library + Python bindings
+
+**Goal**
+Build the transport we'll eventually swap in for NCCL's `net_ib.cc`. Keep the
+public API tiny so it can be a drop-in:
+
+```c
+// transport/rdma/mrc.h
+typedef struct mrc_endpoint mrc_endpoint;
+typedef struct mrc_mr mrc_mr;
+
+int  mrc_init(mrc_endpoint** ep, const char* dev_name);
+int  mrc_register(mrc_endpoint* ep, void* addr, size_t len, mrc_mr** mr);
+int  mrc_connect(mrc_endpoint* ep, const mrc_endpoint_info* remote);
+
+// async, returns a handle; complete via mrc_poll
+int  mrc_write(mrc_endpoint* ep, mrc_mr* local, uint64_t remote_addr,
+               uint32_t rkey, size_t len, uint64_t* req_id);
+int  mrc_read (mrc_endpoint* ep, mrc_mr* local, uint64_t remote_addr,
+               uint32_t rkey, size_t len, uint64_t* req_id);
+int  mrc_poll(mrc_endpoint* ep, uint64_t* completed, size_t max);
+
+void mrc_close(mrc_endpoint* ep);
+```
+
+**What's inside**
+- One RC QP per endpoint (we'll go multi-QP in Section 27)
+- One CQ shared across operations
+- MR cache to amortize `ibv_reg_mr` cost — KV cache base buffers register once at startup
+- Out-of-band connect via TCP for the QP info exchange (LID, QPN, GID, rkey, vaddr)
+
+**Python bindings (`transport/rdma/_py.pyx` or ctypes):**
+```python
+class RdmaEndpoint:
+    def register_gpu_buffer(self, torch_tensor) -> MemoryRegion: ...
+    def connect(self, host, port): ...
+    def write(self, local_mr, remote_handle, offset, length) -> Future: ...
+    def read (self, local_mr, remote_handle, offset, length) -> Future: ...
+```
+
+**Steps**
+- Implement against the Section 24 loopback test; same numbers should pass
+- Add a `KVTransport` class on top: knows how to RDMA WRITE/READ one KV block (size = `2 × BLOCK_SIZE × n_kv_heads × head_dim × n_layers × dtype_bytes`)
+- Microbench: KV-block-sized transfers, 1 → 1024 concurrent in-flight
+- Failure modes: post a WRITE to an unregistered region, oversized SGE, bad rkey — read the resulting `wc.status` and document each
+
+**Learned:** what a verbs transport boils down to once you strip away the
+collective-comms abstractions; how `ibv_reg_mr` cost dominates if you don't
+cache MRs; the QP state machine.
+
+---
+
+## Section 26 — Two-GPU Prefill/Decode Disaggregation (real NIC↔NIC)
+
+**Hardware:** Step 2 — one node, two H100s, two NIC ports (or one dual-port
+NIC). Real NIC↔NIC traffic, even if it's just through the switch on the same
+PCB.
+
+**Files:** `serving/disagg/engine.py` — wire in `KVTransport`
+
+**Goal**
+Replace the Section 22 `cudaMemcpy`-based KV move with real RDMA over the
+mini library from Section 25. Two processes:
+- **Process A (prefill worker)** owns GPU 0, registers its `PagedKVCache` pool with `mrc_register`
+- **Process B (decode worker)** owns GPU 1, registers its `PagedKVCache` pool with `mrc_register`
+- Decode worker pulls the prefilled KV via `mrc_read(...)` per admitted request
+
+**Protocol**
+1. Router admits a request, sends `(prompt_tokens, decode_addr)` to prefill worker
+2. Prefill worker runs prefill into a freshly allocated KV slot, replies with `(block_handles[], rkey, total_len)` to router
+3. Router forwards the handle to decode worker
+4. Decode worker `mrc_read`s the blocks into its own KV pool (block-by-block; gives natural pipelining)
+5. As soon as the **first layer's** KV arrives, decode can start streaming a token (layer-pipelined transfer, optional optimization)
+6. On request finish, both workers free their KV blocks; prefill worker may keep blocks pinned briefly to serve a Radix-cache hit on the next request
+
+**Steps**
+- Make `PagedKVCache.alloc()` return a `MemoryRegion`-aware handle (block_id → (addr, rkey, len))
+- Add a `forward_disagg` path that runs decode against locally-resident KV transferred from a remote
+- Run a 2-rank NCCL all-reduce on the same pair as a baseline (bandwidth, latency, message-size sweep)
+- Run the disagg engine on workload #6 and compare to the integrated Section 15 engine
+
+**What you'll see**
+- A single QP from the prefill→decode transfer **will not** saturate the NIC at modest message sizes. You'll see ~30–50% of line rate at best per QP. This is the moment for Section 27.
+- Pull (RDMA READ) latency is dominated by RTT × log(blocks) until you batch — also fixed in Section 27.
+
+**Learned:** real cross-GPU KV motion, prefill/decode resource decoupling,
+the gap between microbenchmark bandwidth and what one QP gives you under load.
+
+---
+
+## Section 27 — RDMA Optimizations  *(the whole point of building this ourselves)*
+
+**Hardware:** Same 2×H100 node.
+
+**Files:** `transport/rdma/` — extend the mini library
+
+The point of writing our own transport is that we can do things NCCL's
+`net_ib.cc` is conservative about, or that production engines layer on top.
+Each of the items below is a separate measurable optimization.
+
+### 27a — Multi-QP striping
+- One QP per "rail"; KV transfer of *N* bytes is split round-robin across *Q* QPs
+- Each QP gets its own CQ (or shared CQ with batched poll) to avoid serialization
+- **Expected win:** approach line rate on a single NIC (1.5–2× over single QP on large KV transfers)
+- **Trade-off:** more QP state, more registration; pick Q based on message size
+
+### 27b — Doorbell batching
+- Post a *batch* of WRs with one `ibv_post_send` call (linked list of WRs)
+- Set `IBV_SEND_SIGNALED` only on the last WR per batch to keep CQ traffic low
+- **Expected win:** big improvement on KV transfers that span many small blocks (paged KV with 16-token blocks → many WRs)
+
+### 27c — Inline data for small messages
+- For control-plane messages (< 256 B) use `IBV_SEND_INLINE` — payload travels in the WQE itself, no extra DMA
+- **Expected win:** ~2× latency reduction on small messages; mostly relevant for the control plane
+
+### 27d — MR cache + huge pages
+- Pre-register the entire `PagedKVCache` pool once at startup; never re-register at request granularity
+- Allocate the KV pool from 2 MB hugepages to reduce TLB pressure on the NIC
+- **Expected win:** removes a per-request `ibv_reg_mr` of ~hundreds of microseconds
+
+### 27e — Multi-Rail Channel (MRC-inspired) path selection
+- On a host with multiple NICs (or a dual-port NIC), expose each as a separate "rail"
+- A `Channel` is a striped bundle of QPs across rails
+- Path selection per transfer based on hash(req_id) + per-rail occupancy → congestion isolation across requests
+- This is the "MRC" idea referenced above — it's what you reach for once you've watched a single QP saturate on a single rail
+- **Expected win:** linear with rail count up to NIC capacity; congestion from one request stops blocking others
+
+### 27f — Layer-pipelined KV transfer
+- Send KV per layer as it's produced during prefill, not after the whole forward pass finishes
+- Decode worker can start layer 0 the moment layer 0's KV lands
+- **Expected win:** hides most of the KV transfer latency under prefill compute; TTFT after disagg approaches integrated-engine TTFT
+
+### 27g — Adaptive pacing
+- Watch per-QP send-queue depth and outstanding-WR count; throttle when a downstream NIC's CQ depth approaches its credit limit
+- For multi-tenant decode workers, fairness across senders falls out for free
+- **Expected win:** prevents the long-tail latency from one congested transfer poisoning others
+
+**Benchmarks (re-run with each optimization toggled):**
+- KV-block transfer microbench: latency + bandwidth vs message size
+- Workload #6 (mixed-length) end-to-end on the disagg engine
+- A new **workload #11**: 128 concurrent requests, 1 prefill worker + 2 decode workers, 1 KB prompts, 256 decode tokens — designed to saturate the fabric
+
+**Learned:** every optimization in production RDMA stacks earns its line of
+code. By doing them yourself, you'll know exactly which one to reach for when
+a given workload regresses.
+
+---
+
+## Section 28 — Disagg-Aware Scheduler
+
+**Files:** `serving/disagg/scheduler.py`
+
+**Goal**
+A single scheduler that owns prefill workers and decode workers as separate
+resource pools, balances them, and decides when to hold a request vs. ship it.
+
+**Decisions the scheduler makes per iteration**
+- Which prefill worker to send a new request to (least-loaded; affinity if a prefix is cached there)
+- When a prefill finishes, which decode worker to ship the KV to (decode-worker HBM headroom, current batch size, target ITL)
+- Whether to **co-locate** a tiny request (skip the RDMA hop and run prefill+decode on the same GPU when it fits — disagg is a cost, not a free lunch)
+- Backpressure: if decode HBM is full, hold prefill admissions so we don't waste prefill compute we can't ship
+
+**Steps**
+- Extend Section 15 `Scheduler` with worker-pool awareness
+- Add request routing policies (round-robin, least-loaded, prefix-affinity for radix hit)
+- Implement co-location fallback: requests with small prompts + short decode go to a single GPU
+- Decide on the prefill-co-located-with-decode threshold empirically using workload #11
+
+**Benchmarks**
+- p50 / p95 / p99 TTFT and ITL on workloads #6, #8, #11 with disagg vs integrated
+- Throughput at fixed SLOs (e.g., "p99 TTFT < 200 ms, p99 ITL < 30 ms — how many QPS?")
+- "Goodput": tokens/sec *that meet the SLO*, not raw tokens/sec
+
+**Learned:** disagg is only a win when the scheduler is good enough to keep
+both pools saturated; the routing policy is half the engine.
+
+---
+
+## Phase 2 build-order summary
+
+```
+Hardware step 0 — local
+  Section 22     serving/disagg/{roles,protocol,engine}.py    architecture, no RDMA yet
+
+Hardware step 1 — one H100 + ConnectX (~$2/hr)
+  Section 23     docs/nccl_verbs_walkthrough.md               NCCL + IB observation
+  Section 24     transport/rdma/loopback_test.c               GPUDirect RDMA loopback
+  Section 25     transport/rdma/mrc.{h,c} + python bindings   mini libibverbs transport
+
+Hardware step 2 — two H100s on one node (~$4/hr)
+  Section 26     serving/disagg/engine.py (RDMA wired in)     real prefill→decode KV transfer
+  Section 27     transport/rdma/ (multi-QP, doorbell batch,
+                                  inline, MR cache, MRC rails,
+                                  layer pipeline, pacing)     RDMA-side optimizations
+  Section 28     serving/disagg/scheduler.py                  disagg-aware scheduling
+```
+
+All natural further steps once Phase 2 lands: tensor / pipeline / sequence
+parallelism, true cross-host RDMA over a real switch fabric, INT4/AWQ/GPTQ,
+Medusa/EAGLE tree spec decoding, structured outputs.
