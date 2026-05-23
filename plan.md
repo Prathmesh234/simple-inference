@@ -704,6 +704,430 @@ capture/replay semantics, why static shapes + static memory are the cost of admi
 
 ---
 
+## Section 20 — Speculative Decoding  *(decode-throughput multiplier)*
+
+**Builds on:** Section 19. Works with paged or contiguous KV.
+
+**Files:** `serving/speculative.py`, `model/draft_model.py`
+
+**Problem it solves**
+Autoregressive decode is fundamentally sequential — one token per forward
+pass. Even with CUDA graphs, a 30B model decodes at maybe 30–60 tok/s on a
+single 48 GB Ada. Memory bandwidth, not compute, is the bottleneck: each
+decode step reads the full weights once to emit one token.
+
+**Solution: emit K tokens per heavy-model forward**
+- **Draft** model proposes K candidate tokens cheaply (small model, EAGLE
+  head, n-gram match against the prompt, or Medusa heads on the base model)
+- **Verify** by running the heavy model on all K positions **in parallel**
+  (one forward, K logits, no K× cost — the model is memory-bound at batch ≈1)
+- Accept the longest prefix where draft and verify agree under the sampling
+  policy. Discard the rest. **Acceptance rate of 60–80 % is typical.**
+
+```python
+# Per decode step
+draft_tokens = draft.propose(last_tok, K=5)            # K candidates
+logits       = heavy.forward(draft_tokens, kv_cache)   # one parallel forward
+accept_len   = longest_prefix_where(sample(logits) == draft_tokens)
+emit(draft_tokens[:accept_len])
+rollback_cache(K - accept_len)                         # drop rejected K/V
+```
+
+**Three flavors to study (build in this order)**
+1. **N-gram speculation** — no draft model. Match the last few decoded tokens
+   against the prompt itself; if matched, propose the next K tokens from
+   the prompt. Free, zero-VRAM, surprisingly effective on RAG / code / quote-heavy workloads.
+2. **Small draft model** — e.g. Llama-3.2-1B drafting for Llama-3.1-32B.
+   Plain two-model setup, simplest to reason about.
+3. **EAGLE / Medusa heads** — small extra heads on the base model predict
+   the *features* of the next K tokens, then a tiny LM head decodes them.
+   Higher acceptance than a separate draft (shares features), and no second
+   model to load.
+
+**Steps**
+- Implement n-gram first (no extra weights, isolates the verification logic)
+- Then wire the draft model + KV cache for *both* models
+- Carefully handle: rollback of rejected K/V in BOTH caches, sampling-policy-correct verification (greedy is easy, top-p requires Leviathan-style rejection sampling for unbiased acceptance)
+- Capture a CUDA graph for the K-position verify forward
+
+**Benchmark:**
+Decode tok/s with K=1 (= no speculation), K=3, K=5, K=8. Acceptance rate per workload.
+
+**Expected win:**
+- 1.5–2.5× decode throughput on dense models (memory-bound regime)
+- Larger wins as model size grows — this is **the** lever for 30B+ dense models
+
+**Learned:** memory-bandwidth bottleneck of decode, parallel verification as a free lunch in the memory-bound regime, draft-quality vs acceptance-rate trade-off, why speculative decoding *doesn't* help when you're already compute-bound (large batches).
+
+---
+
+## Section 21 — Quantization  *(makes big dense models fit)*
+
+**Builds on:** Sections 7, 8 (matmuls), 11/16 (KV cache).
+
+**Files:** `quant/w4a16.py`, `quant/fp8_kv.py`, optionally `kernels/marlin_kernel.py`
+
+**Problem it solves**
+A 32B dense model is ~64 GB in BF16 → does not fit on a single 48 GB Ada.
+At W4A16 (4-bit weights, 16-bit activations) it's ~16 GB. With FP8 KV cache
+on top, a 32B model with 8k context fits comfortably with room for batching.
+**Quantization is the single biggest knob for "which models we can run."**
+
+**Two independent axes**
+
+### 21a — Weight quantization (W4A16, W8A16)
+- Per-channel or per-group (group_size=128 is the de-facto standard)
+- Quantize offline; load quantized weights at startup
+- At decode the matmul is W4A16: dequantize a tile of W to BF16 in registers, fuse into the matmul
+- **Kernel matters enormously** — naive dequant-then-matmul loses to BF16; the win comes from Marlin/Machete-style kernels that dequantize *inside* the MMA loop
+- Calibration: AWQ (activation-aware scaling) is the cheap-and-good default; GPTQ is a more thorough Hessian-based method
+
+### 21b — KV cache quantization (FP8 / INT8)
+- KV cache often eats more memory than weights at long context — quantizing it doubles concurrency or context length
+- Per-head, per-tile dynamic scaling
+- Quality cost: negligible at FP8, mild at INT8
+
+**Steps**
+- 21a: implement a reference W4A16 dequant + matmul in PyTorch, verify vs BF16
+- 21a: replace the slow path with a Marlin-style Triton kernel (could be Section 14f material)
+- 21b: add FP8 mode to the KV cache; convert on write, dequant on read inside attention
+- Verify perplexity on a small calibration set vs full BF16 (target: < 1 % degradation)
+
+**Benchmark:**
+- Same workload, BF16 vs W4A16 vs W4A16+FP8-KV
+- Per-token latency, peak VRAM, **max concurrent requests** (this is where the real win shows)
+
+**Expected win:**
+- W4A16: ~3.5× weight memory reduction; matmul throughput ~equal or slightly faster than BF16 with a good kernel (it's memory-bound!)
+- FP8 KV: 2× more concurrent requests or 2× context length at iso-VRAM
+
+**Learned:** memory hierarchy of LLM inference (weights vs KV vs activations), why W4A16 is faster than BF16 in the memory-bound regime, calibration trade-offs, kernel-level fusion as the price of admission.
+
+---
+
+## Section 22 — Zero-overhead Scheduler  *(Python overhead killer)*
+
+**Builds on:** Section 15 (scheduler), Section 19 (CUDA graphs).
+
+**Files:** `serving/async_scheduler.py`, `serving/tokenizer_worker.py`
+
+**Problem it solves**
+Once CUDA graphs collapse GPU launch overhead and quantization makes weights
+cheap to read, **the bottleneck moves to Python**. A naive scheduler does
+~3–5 ms of work per step (token sampling, sequence updates, prepping the
+next batch's metadata, detokenizing finished tokens). At 200 tok/s that's
+the entire step time — the GPU sits idle waiting for Python.
+
+**Solution: overlap scheduler work with GPU compute**
+
+```
+GPU:    [forward step N] [forward step N+1] [forward step N+2] ...
+CPU:               [sched N+1, detok N-1] [sched N+2, detok N] ...
+```
+
+- **Async output thread** — detokenization runs on a worker; the engine
+  pushes raw token ids into a queue and returns immediately
+- **Multi-step lookahead** — prepare the *next* step's batch metadata
+  (block tables, position ids, sampling params) while the GPU runs the
+  current step
+- **Async tokenizer** — new requests are tokenized on a CPU thread, not
+  in the hot path
+- **Persistent decoder state** — keep sequence objects, sampling state,
+  and stopping criteria on the engine side so the scheduler never copies
+  big Python objects per step
+
+**Steps**
+- Profile where Python time actually goes (cProfile + py-spy) — surprises
+  abound (often it's `tokenizer.decode` or list comprehensions)
+- Hoist all per-step Python work into either: pre-computed at request
+  admission, or post-step on a worker thread
+- Use lock-free `collections.deque` / `asyncio.Queue` between engine and workers
+- Verify: GPU SM utilization should approach 100 % during sustained decode
+
+**Benchmark:**
+Decode tok/s on workload #5 (1024 sequences, 32 batch) with naive scheduler vs async.
+GPU SM utilization sampled with `nvidia-smi dmon`.
+
+**Expected win:**
+- 1.3–1.8× decode throughput at small batch (where Python time is most exposed)
+- GPU utilization climbs from ~60 % to ~95 %
+
+**Learned:** profiling Python overhead in tight inference loops, async pipelining as a near-free lunch, why the last 30 % of GPU utilization usually lives in your scheduler.
+
+---
+
+## Section 23 — Prefill / Decode Disaggregation  *(optional, multi-process)*
+
+**Builds on:** Section 18 (chunked prefill is a single-GPU alternative).
+Requires Section 16 (paged cache) for cross-process KV handoff.
+
+**Files:** `serving/prefill_worker.py`, `serving/decode_worker.py`, `serving/kv_transfer.py`
+
+**Problem it solves**
+Prefill is compute-bound; decode is memory-bound. Mixing them on one GPU
+means either prefill steals decode tokens' latency (head-of-line blocking)
+or decode underutilizes the prefill-sized batch. Chunked prefill (§18)
+mitigates this on a single GPU; *disaggregation* solves it by giving each
+phase its own GPU(s).
+
+**Architecture**
+- **Prefill workers** run prompts → produce KV cache. Optimized for big
+  prefill batches, no decode latency target.
+- **Decode workers** receive KV from prefill workers, run the decode loop.
+  Optimized for low-latency decode (CUDA graphs, speculation).
+- **KV transfer** moves the cache between workers — over NVLink if
+  co-located, RDMA / shared memory / NCCL P2P otherwise.
+
+**Why we put this last in Phase 3**
+- It's a *systems* optimization, not a model optimization
+- The wins only materialize at production-scale traffic with mixed
+  long-prefill + steady-decode load
+- Single-GPU deployments get most of the benefit from chunked prefill (§18) — disaggregation is the next step *only* when you have multiple GPUs and an SLO-sensitive workload
+
+**Benchmark:**
+Mixed workload (#7 + #5 concurrent) on (a) single GPU with chunked prefill, (b) two GPUs with disaggregation. Measure: p50/p95/p99 TTFT, p50/p95/p99 ITL, total throughput.
+
+**Learned:** how Pareto-optimal SLOs differ for compute-bound vs memory-bound phases, KV-transfer engineering as a real bottleneck (often the new critical path), when disaggregation is *not* worth it (low traffic, balanced workloads).
+
+---
+
+## Phase 4 — Dense Model Expansion  *(generalize beyond 3B)*
+
+This is where the engine stops being a Llama-3.2-3B project and becomes a
+real dense-model inference engine. **Everything from Phases 1–3 must
+continue to work**, validated on each new model.
+
+Target models (single-GPU on 48 GB Ada, with §21 quantization):
+- **Llama-3.1-8B**  (BF16 fits; baseline for "bigger than 3B")
+- **Qwen2.5-14B**   (BF16 fits with tight margins; W8A16 comfortable)
+- **Qwen2.5-32B / Llama-3.1-Nemotron-32B-class**  (requires W4A16)
+- **Mistral-Small-24B-class**
+
+We deliberately stay with **dense** transformers — no MoE in this phase.
+Sparse models change the parallelism story; we cover that separately in
+Phase 5.
+
+---
+
+## Section 24 — Generic Dense-Model Support
+
+**Files:** `config.py` (generalize), `loader.py` (broaden), `model/llama.py` → `model/dense_lm.py`
+
+**Goal**
+Replace the hardcoded Llama-3.2-3B config with a model-family abstraction
+that can express the variations found across modern dense LMs:
+- Hidden size, layer count, head count, KV-head count (GQA / MHA / MQA)
+- RoPE base / scaling (linear, YaRN, NTK-aware) — Llama-3 vs Qwen2.5 differ
+- Activation (SwiGLU vs GeGLU)
+- Norm placement (pre-norm vs sandwich-norm)
+- Tied vs untied embeddings
+- Vocab size (and special-token handling per tokenizer family)
+
+**Steps**
+- Refactor `ModelConfig` into a registry: `from_hf_config(hf_cfg) → ModelConfig`
+- Audit `ops/rope.py` for scaling-method support (Llama-3 uses scaled RoPE, Qwen2.5 plain)
+- Audit `model/block.py` for activation-fn and norm-placement parametrization
+- Audit `loader.py` weight-name maps for each model family
+- Verify every model against HF `transformers` (same correctness harness as Section 10)
+
+**Deliverable:** a single `serve(model_id, prompt)` entry point that works on Llama-3.1-8B, Qwen2.5-14B, Qwen2.5-32B-W4A16, and Llama-3.2-3B (no regressions on the original).
+
+**Learned:** the small but real divergence across "Llama-like" families, why most papers ship a model-family adapter rather than reimplementing the world.
+
+---
+
+## Section 25 — Cross-model Validation Suite
+
+**Files:** `benchmarks/run_dense_suite.py`
+
+**Goal**
+Re-run the iteration-12 (full Phase-3) engine on every supported model and
+produce a comparison matrix:
+
+| model            | bf16/quant | prefill tok/s | decode tok/s | peak VRAM | max concurrent |
+|------------------|-----------|--------------:|-------------:|----------:|---------------:|
+| Llama-3.2-3B     | BF16      |               |              |           |                |
+| Llama-3.1-8B     | BF16      |               |              |           |                |
+| Qwen2.5-14B      | BF16      |               |              |           |                |
+| Qwen2.5-14B      | W4A16     |               |              |           |                |
+| Qwen2.5-32B      | W4A16     |               |              |           |                |
+
+Every Phase-3 optimization (paged, radix, chunked, graphs, speculation,
+quant) must be on simultaneously. If any single one regresses for a
+specific model family, that's the bug to fix before Phase 5.
+
+**Learned:** how engine performance characteristics shift with model size — what was decode-latency-bound at 3B may become weight-memory-bound at 32B.
+
+---
+
+## Phase 5 — Multi-GPU Parallelism  *(only after Phase 4 works)*
+
+Single-node, 2 or 4 GPU configurations (NVLink between RTX 6000 Ada cards,
+or the next-tier hardware we move to). **All earlier phases continue to
+hold**; parallelism is an additive layer.
+
+We do **not** cover multi-node here. Multi-node adds an interconnect
+(InfiniBand / RoCE) and a fault-tolerance story that doubles the project's
+surface area for marginal pedagogical gain.
+
+---
+
+## Section 26 — Tensor Parallelism  *(weight split across GPUs)*
+
+**Builds on:** all of Phases 1–4.
+
+**Files:** `parallel/tp.py`, `parallel/layers.py`
+
+**The Megatron split** (read the Megatron-LM paper first)
+- **Attention QKV:** column-parallel — each rank holds `n_heads / TP` heads
+  for Q, and `n_heads_kv / TP` heads for K, V (requires TP divides KV head count — for GQA-8 → TP ∈ {1, 2, 4, 8})
+- **Attention output proj:** row-parallel
+- **MLP up + gate:** column-parallel
+- **MLP down:** row-parallel
+- **One all-reduce per attention block, one per MLP block** — two collectives per layer
+
+```python
+# Column-parallel linear: split output dim
+class ColumnParallelLinear(nn.Module):
+    def forward(self, x):           # x is replicated across ranks
+        return F.linear(x, self.weight_shard)   # output is sharded
+
+# Row-parallel linear: split input dim, all-reduce the result
+class RowParallelLinear(nn.Module):
+    def forward(self, x_shard):     # x is sharded across ranks
+        y_local = F.linear(x_shard, self.weight_shard)
+        return all_reduce(y_local)  # SUM across ranks
+```
+
+**Steps**
+- Initialize NCCL process group; one process per GPU
+- Shard weights at load time (not at runtime) — `loader.py` learns about TP rank
+- Wire all-reduce into the residual path *exactly* where Megatron specifies
+- Verify: TP=2 output bit-similar (BF16 tolerance) to TP=1 on the same prompts
+- Profile: where does NCCL all-reduce show up in the timeline? (Hint: it dominates decode.)
+
+**Benchmark:**
+Llama-3.1-32B (BF16) on TP=2 vs Qwen2.5-32B-W4A16 on TP=1.
+Compare: prefill throughput, decode latency, peak VRAM per GPU.
+
+**Expected win:**
+- Lets us run models that don't fit on one GPU (32B BF16, or 70B W4A16)
+- Per-GPU decode latency typically gets *worse* than single-GPU due to all-reduce — TP is for *capacity*, not for speed at the same model size
+
+**Learned:** the difference between weight-parallel and data-parallel inference, why TP is a capacity tool not a latency tool, the all-reduce as the new critical path.
+
+---
+
+## Section 27 — Custom All-reduce for Decode  *(small-message latency killer)*
+
+**Builds on:** Section 26.
+
+**Files:** `parallel/custom_ar.py`, `kernels/all_reduce_kernel.py`
+
+**Problem it solves**
+NCCL is tuned for big payloads (gradient sync in training: tens of MB).
+Decode all-reduce sends one activation tensor of shape `[batch, hidden]`
+≈ 50–200 KB. NCCL's launch + scheduling overhead is comparable to the
+actual data movement at this size, leaving 30–50 % of the all-reduce time
+on the table.
+
+**Solution: a CUDA-IPC-based custom reduce**
+- Map each rank's output buffer into every other rank's address space via
+  `cudaIpcOpenMemHandle`
+- A single fused kernel reads from all peer pointers and writes the
+  sum locally — no driver-side collective scheduling
+- Falls back to NCCL above a payload threshold (~1 MB)
+
+**Steps**
+- Stand up CUDA IPC handle exchange at process-group init
+- Implement the reduce kernel (Triton or CUDA C++)
+- Hook into TP via a flag — same numerics as NCCL, swap-in only
+- Measure: per-op all-reduce latency at 1 KB, 10 KB, 100 KB, 1 MB
+
+**Benchmark:**
+Single-token decode latency on a TP=2 32B model, NCCL vs custom AR.
+
+**Expected win:**
+- ~2× faster all-reduce in the < 100 KB regime
+- 10–20 % end-to-end decode latency improvement
+
+**Learned:** when collective-comm libraries are over-engineered for your payload size, CUDA IPC as a sharp tool, fused reduce kernels.
+
+---
+
+## Section 28 — Sequence Parallelism  *(halves activation memory in TP)*
+
+**Builds on:** Section 26.
+
+**Files:** `parallel/sp.py`
+
+**The idea (Megatron-SP paper)**
+TP shards weights but *replicates* activations across ranks for the
+non-linear regions (RMSNorm, residual, dropout-equivalent). At long
+context that activation memory is huge. Sequence Parallelism splits those
+activations along the **sequence dimension** instead of replicating them.
+
+**Net effect**
+- Activation memory of norm/residual blocks shrinks by `1/TP`
+- The two all-reduces per layer become `all-gather + reduce-scatter` —
+  same total bytes, but the activation never lives un-sharded
+- Enables 2–3× longer context at iso-VRAM
+
+**Steps**
+- Replace `all_reduce` after row-parallel matmul with `reduce_scatter`
+- Replace activation broadcast before column-parallel matmul with `all_gather`
+- Make sure RMSNorm operates on the sequence-sharded activation correctly
+  (each rank holds a slice of tokens, computes its own row-wise norm)
+- Verify numerics vs plain TP
+
+**Learned:** how to find the activation-memory wins inside a parallelism scheme without changing the collectives' total cost.
+
+---
+
+## Section 29 — Two-batch Overlap  *(hide collectives under compute)*
+
+**Builds on:** Sections 26–28.
+
+**Files:** `parallel/tbo.py`
+
+**The idea**
+In TP, decode time is `compute + all_reduce + compute + all_reduce + ...`.
+If we split the active batch in two micro-batches and pipeline them, we
+can run `compute(A_layer_i)` *concurrently with* `all_reduce(B_layer_i-1)`
+on a separate CUDA stream. The all-reduce becomes free as long as it
+fits under the compute.
+
+```
+Stream 0 (compute): [A.L0] [B.L0] [A.L1] [B.L1] [A.L2] [B.L2] ...
+Stream 1 (comm):           [A.L0]      [B.L0]      [A.L1]     ...
+```
+
+**Steps**
+- Run forward on two CUDA streams, with explicit events for hand-offs
+- Split the active batch by 2 just before the TP layers
+- Re-merge before sampling
+- Verify decode tok/s win vs vanilla TP
+
+**Caveat:** this works for prefill more easily than decode (more compute to hide behind). For decode it needs decoders with enough hidden-dim that the compute > comm.
+
+**Learned:** stream-level parallelism inside a single GPU, when comm/compute overlap is actually beneficial.
+
+---
+
+## Section 30 — Pipeline & Expert Parallelism  *(optional)*
+
+**Pipeline parallelism (PP)** — split *layers* across GPUs, micro-batch the
+input, pipeline forward passes. Useful only when TP saturates intra-node
+NVLink and you need *more* GPUs (e.g. > 4) or when crossing nodes.
+For ≤ 4 GPUs on one node, **TP almost always beats PP** for inference.
+
+**Expert parallelism (EP)** — only relevant if we ever serve MoE models
+(Mixtral, DeepSeek-V3, Qwen2-MoE). Different routing semantics, different
+collective pattern (all-to-all instead of all-reduce). Big topic; treat as
+a *separate* phase if we go there. Out of scope for the dense-model goal.
+
+---
+
 ## Build Order Summary
 
 ```
@@ -735,6 +1159,21 @@ Phase 3 — Serving optimizations (multi-request)
   Section 17     serving/radix_cache.py      RadixAttention / prefix caching
   Section 18     serving/scheduler.py (mod)  chunked prefill
   Section 19     serving/cuda_graph_pool.py  CUDA graphs for decode
+  Section 20     serving/speculative.py      speculative decoding (n-gram → draft → EAGLE)
+  Section 21     quant/                       W4A16 weights + FP8 KV cache
+  Section 22     serving/async_scheduler.py  zero-overhead scheduler / async pipeline
+  Section 23     serving/{prefill,decode}_worker.py  prefill/decode disaggregation (optional)
+
+Phase 4 — Dense model expansion (beyond Llama-3.2-3B)
+  Section 24     model/dense_lm.py            generic dense-LM support (Llama 8B/Qwen 14B/32B/…)
+  Section 25     benchmarks/run_dense_suite.py cross-model validation matrix
+
+Phase 5 — Multi-GPU parallelism (single-node, 2 or 4 GPU)
+  Section 26     parallel/tp.py               tensor parallelism (Megatron split)
+  Section 27     parallel/custom_ar.py        custom all-reduce for decode
+  Section 28     parallel/sp.py               sequence parallelism
+  Section 29     parallel/tbo.py              two-batch overlap (comm/compute)
+  Section 30     parallel/{pp,ep}.py          pipeline / expert parallelism (optional)
 ```
 
 ---
@@ -780,6 +1219,21 @@ iterations/
                                  │
   11_chunked_prefill.py         + chunked prefill scheduling (Section 18) — built on 09 (the main path)
   12_cuda_graphs.py             + CUDA graphs for decode (Section 19) — built on 11
+  13_speculative.py             + speculative decoding (Section 20) — built on 12
+  14_quantized.py               + W4A16 + FP8 KV (Section 21) — built on 13
+  15_async_engine.py            + zero-overhead scheduler (Section 22) — built on 14
+  16_disagg.py                  + prefill/decode disaggregation (Section 23, optional) — built on 15
+
+  ── Phase 4: re-validate the engine on bigger dense models ──
+  17_dense_lm_8b.py             same engine as 15, target = Llama-3.1-8B (BF16)
+  18_dense_lm_14b.py            same engine as 15, target = Qwen2.5-14B (BF16 / W8A16)
+  19_dense_lm_32b.py            same engine as 15, target = Qwen2.5-32B (W4A16 required)
+
+  ── Phase 5: multi-GPU (run via torchrun, 2–4 processes) ──
+  20_tp.py                      tensor parallelism (Section 26)
+  21_tp_custom_ar.py            + custom all-reduce (Section 27) — built on 20
+  22_tp_sp.py                   + sequence parallelism (Section 28) — built on 21
+  23_tp_tbo.py                  + two-batch overlap (Section 29) — built on 22
 ```
 
 **Why 09 and 10 fork from 08 independently:** PagedAttention and RadixAttention
@@ -809,6 +1263,31 @@ across **all** iterations.
 - **Compare 09 vs 10 head-to-head** on workloads #6, #7, #8 — paged dominates max-concurrency, radix dominates shared-prefix
 - `09 → 11`: p95/p99 tail latency drops 30-50% under load
 - `11 → 12`: small-batch decode latency drops 1.5-2× from killing launch overhead
+- `12 → 13`: decode tok/s jumps 1.5–2.5× via speculation (acceptance-rate-dependent)
+- `13 → 14`: max concurrent requests + max model size jump (quantization)
+- `14 → 15`: sustained-decode GPU SM utilization climbs ~60 % → ~95 %
+- `15 → 16`: TTFT under mixed prefill/decode load improves (disaggregation)
+- `16 → 17–19`: same engine code, model size sweep — performance characteristics shift from latency-bound (3B) to weight-memory-bound (32B)
+- `19 → 20`: enables models that don't fit on one GPU; per-GPU decode latency typically *increases* — TP is a capacity tool
+- `20 → 21–23`: each multi-GPU optimization claws back the latency TP costs
+
+---
+
+## What This Is NOT
+
+- Not flash-attention from scratch beyond pedagogical level (Section 14d studies it; production use can call FlashAttention-3 / FlashInfer)
+- Not multi-node distributed inference (single-node 2–4 GPU only)
+- Not MoE / sparse models (expert parallelism only mentioned, not built)
+- Not training, not fine-tuning, not LoRA serving
+- Not multimodal (vision encoders, audio)
+- Not structured-output decoding (JSON schema / XGrammar / Outlines)
+
+Phases 1–3 give us the engine. Phase 4 generalizes it across dense models.
+Phase 5 scales it across GPUs. The goal — **phenomenal performance on
+dense models** — is met when the Phase 5 engine, running a 30B-class dense
+model under W4A16 + FP8-KV + speculative decoding + paged attention +
+radix prefix caching + CUDA graphs + TP-2, beats a stock vLLM/SGLang
+deployment on the same hardware on at least one workload class. That's the bar.
 
 ---
 
@@ -820,16 +1299,3 @@ across **all** iterations.
 4. **Numerical match** — diff against `transformers`; bfloat16 tolerance ~1e-2, float32 ~1e-5
 5. **Benchmark before moving on** — record to `results_baseline.json` so Phase 2 has a clean baseline
 6. **Same five workloads in every `iterations/` file** — apples-to-apples comparison
-
----
-
-## What This Is NOT
-
-- Not flash-attention (we study it, then optionally write it in Section 14d)
-- Not quantization (INT4/AWQ/GPTQ/FP8)
-- Not speculative decoding (Medusa, EAGLE, draft+verify)
-- Not multi-GPU (tensor / pipeline / sequence parallelism)
-- Not structured outputs (JSON schema constrained decoding)
-- Not disaggregated prefill/decode serving
-
-All natural next steps once you understand Phases 1-3.
