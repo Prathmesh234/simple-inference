@@ -3,39 +3,85 @@
     "pytorch": [
       {
         "label": "B=1 T=1 H=3072",
-        "latency_ms": 0.0184,
-        "bandwidth_gb_s": 0.67,
+        "latency_ms": 0.0177,
+        "bandwidth_gb_s": 0.7,
         "batch": 1,
         "seq_len": 1,
         "hidden": 3072,
-        "peak_bw_pct": 0.1
+        "peak_bw_pct": 0.1,
+        "tc_util_pct": 0.0
       },
       {
         "label": "B=1 T=128 H=3072",
-        "latency_ms": 0.03,
-        "bandwidth_gb_s": 52.51,
+        "latency_ms": 0.0291,
+        "bandwidth_gb_s": 54.14,
         "batch": 1,
         "seq_len": 128,
         "hidden": 3072,
-        "peak_bw_pct": 5.5
+        "peak_bw_pct": 5.6,
+        "tc_util_pct": 0.0
       },
       {
         "label": "B=1 T=512 H=3072",
-        "latency_ms": 0.0444,
-        "bandwidth_gb_s": 141.56,
+        "latency_ms": 0.0454,
+        "bandwidth_gb_s": 138.67,
         "batch": 1,
         "seq_len": 512,
         "hidden": 3072,
-        "peak_bw_pct": 14.7
+        "peak_bw_pct": 14.4,
+        "tc_util_pct": 0.0
       },
       {
         "label": "B=1 T=2048 H=3072",
-        "latency_ms": 0.1226,
-        "bandwidth_gb_s": 205.21,
+        "latency_ms": 0.1227,
+        "bandwidth_gb_s": 205.07,
         "batch": 1,
         "seq_len": 2048,
         "hidden": 3072,
-        "peak_bw_pct": 21.4
+        "peak_bw_pct": 21.4,
+        "tc_util_pct": 0.0
+      }
+    ],
+    "triton": [
+      {
+        "label": "B=1 T=1 H=3072",
+        "latency_ms": 0.0043,
+        "bandwidth_gb_s": 2.84,
+        "batch": 1,
+        "seq_len": 1,
+        "hidden": 3072,
+        "peak_bw_pct": 0.3,
+        "tc_util_pct": 0.0
+      },
+      {
+        "label": "B=1 T=128 H=3072",
+        "latency_ms": 0.007,
+        "bandwidth_gb_s": 223.74,
+        "batch": 1,
+        "seq_len": 128,
+        "hidden": 3072,
+        "peak_bw_pct": 23.3,
+        "tc_util_pct": 0.0
+      },
+      {
+        "label": "B=1 T=512 H=3072",
+        "latency_ms": 0.0112,
+        "bandwidth_gb_s": 562.02,
+        "batch": 1,
+        "seq_len": 512,
+        "hidden": 3072,
+        "peak_bw_pct": 58.5,
+        "tc_util_pct": 0.0
+      },
+      {
+        "label": "B=1 T=2048 H=3072",
+        "latency_ms": 0.0354,
+        "bandwidth_gb_s": 710.9,
+        "batch": 1,
+        "seq_len": 2048,
+        "hidden": 3072,
+        "peak_bw_pct": 74.1,
+        "tc_util_pct": 0.1
       }
     ]
   },
@@ -367,5 +413,200 @@
         "speedup_vs_prefill": 17.15
       }
     ]
+  },
+  "sampling": {
+    "pytorch": [
+      {
+        "label": "greedy B=1",
+        "latency_ms": 0.0311,
+        "batch": 1,
+        "temperature": 0
+      },
+      {
+        "label": "greedy B=8",
+        "latency_ms": 0.0345,
+        "batch": 8,
+        "temperature": 0
+      },
+      {
+        "label": "greedy B=32",
+        "latency_ms": 0.0474,
+        "batch": 32,
+        "temperature": 0
+      },
+      {
+        "label": "sample T=1.0  (pure multinomial) B=1",
+        "latency_ms": 0.0949,
+        "batch": 1,
+        "temperature": 1.0
+      },
+      {
+        "label": "sample T=1.0  (pure multinomial) B=8",
+        "latency_ms": 0.101,
+        "batch": 8,
+        "temperature": 1.0
+      },
+      {
+        "label": "sample T=1.0  (pure multinomial) B=32",
+        "latency_ms": 0.1361,
+        "batch": 32,
+        "temperature": 1.0
+      },
+      {
+        "label": "sample T=0.7  top_k=50 B=1",
+        "latency_ms": 0.1702,
+        "batch": 1,
+        "temperature": 0.7,
+        "top_k": 50
+      },
+      {
+        "label": "sample T=0.7  top_k=50 B=8",
+        "latency_ms": 0.1929,
+        "batch": 8,
+        "temperature": 0.7,
+        "top_k": 50
+      },
+      {
+        "label": "sample T=0.7  top_k=50 B=32",
+        "latency_ms": 0.2802,
+        "batch": 32,
+        "temperature": 0.7,
+        "top_k": 50
+      },
+      {
+        "label": "sample T=0.7  top_p=0.9 B=1",
+        "latency_ms": 0.2043,
+        "batch": 1,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      {
+        "label": "sample T=0.7  top_p=0.9 B=8",
+        "latency_ms": 0.4525,
+        "batch": 8,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      {
+        "label": "sample T=0.7  top_p=0.9 B=32",
+        "latency_ms": 0.9589,
+        "batch": 32,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      {
+        "label": "sample T=0.7  k=50  p=0.9 B=1",
+        "latency_ms": 0.3102,
+        "batch": 1,
+        "temperature": 0.7,
+        "top_k": 50,
+        "top_p": 0.9
+      },
+      {
+        "label": "sample T=0.7  k=50  p=0.9 B=8",
+        "latency_ms": 0.4875,
+        "batch": 8,
+        "temperature": 0.7,
+        "top_k": 50,
+        "top_p": 0.9
+      },
+      {
+        "label": "sample T=0.7  k=50  p=0.9 B=32",
+        "latency_ms": 0.9533,
+        "batch": 32,
+        "temperature": 0.7,
+        "top_k": 50,
+        "top_p": 0.9
+      }
+    ]
+  },
+  "run_baseline": {
+    "description": "Section 13 full baseline: prefill throughput, decode throughput, per-op breakdown.",
+    "hardware": "RTX 6000 Ada (48 GB, 960 GB/s BW, 1457 TFLOPS BF16)",
+    "dtype": "bfloat16",
+    "prefill": [
+      {
+        "seq_len": 64,
+        "latency_ms": 19.338,
+        "tokens_per_sec": 3309.5,
+        "peak_vram_mb": 6854.4
+      },
+      {
+        "seq_len": 128,
+        "latency_ms": 18.6,
+        "tokens_per_sec": 6881.7,
+        "peak_vram_mb": 6871.5
+      },
+      {
+        "seq_len": 256,
+        "latency_ms": 19.701,
+        "tokens_per_sec": 12994.3,
+        "peak_vram_mb": 6905.0
+      },
+      {
+        "seq_len": 512,
+        "latency_ms": 34.409,
+        "tokens_per_sec": 14879.6,
+        "peak_vram_mb": 6973.5
+      },
+      {
+        "seq_len": 1024,
+        "latency_ms": 68.113,
+        "tokens_per_sec": 15033.8,
+        "peak_vram_mb": 7106.2
+      }
+    ],
+    "decode": [
+      {
+        "batch": 1,
+        "prefill_tokens": 128,
+        "latency_ms": 19.727,
+        "tokens_per_sec": 50.7,
+        "peak_vram_mb": 6860.9
+      },
+      {
+        "batch": 1,
+        "prefill_tokens": 512,
+        "latency_ms": 19.699,
+        "tokens_per_sec": 50.8,
+        "peak_vram_mb": 6911.2
+      },
+      {
+        "batch": 8,
+        "prefill_tokens": 128,
+        "latency_ms": 20.68,
+        "tokens_per_sec": 386.8,
+        "peak_vram_mb": 7026.3
+      },
+      {
+        "batch": 8,
+        "prefill_tokens": 512,
+        "latency_ms": 20.11,
+        "tokens_per_sec": 397.8,
+        "peak_vram_mb": 7416.8
+      }
+    ],
+    "op_breakdown_T512": {
+      "rmsnorm": {
+        "total_ms": 8.048,
+        "pct_of_forward": 23.5
+      },
+      "attention": {
+        "total_ms": 14.236,
+        "pct_of_forward": 41.6
+      },
+      "mlp": {
+        "total_ms": 18.615,
+        "pct_of_forward": 54.4
+      },
+      "other": {
+        "total_ms": 0.0,
+        "pct_of_forward": 0.0
+      },
+      "full_forward": {
+        "total_ms": 34.209,
+        "pct_of_forward": 100.0
+      }
+    }
   }
 }

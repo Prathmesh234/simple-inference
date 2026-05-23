@@ -85,7 +85,10 @@ class KVCache:
         self.head_dim    = head_dim
         self.dtype       = dtype
         self.device      = torch.device(device)
-
+        ##this is the limitation paged attention addresses 
+        ## so right now we are blocking for the entire seq len, but in reality we never know what is going to be the user 
+        ## sequence request. For all you know we blocked 1024 tokens worth of KV Cache memory but the user 
+        ## sent a request with like 10 tokens wasting 1014 slots 
         shape = (n_layers, max_batch, n_heads_kv, max_seq_len, head_dim)
         self.k_cache = torch.zeros(shape, dtype=dtype, device=self.device)
         self.v_cache = torch.zeros(shape, dtype=dtype, device=self.device)
