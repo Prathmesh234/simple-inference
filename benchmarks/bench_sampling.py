@@ -151,7 +151,7 @@ def run_benchmarks():
             logits = torch.randn(B, VOCAB, device=DEVICE, dtype=DTYPE)
             lat = bench_fn(lambda: sample(logits, **kwargs))
             print(f"  {label:<42} {B:>3}  {lat:>9.4f}ms")
-            record("sampling", "pytorch", f"{label} B={B}", lat, bw_gb_s=0.0,
+            record("sampling", "pytorch", f"{label} B={B}", lat,
                    extra={"batch": B, **{k: v for k, v in kwargs.items()}})
 
 
