@@ -151,35 +151,39 @@
     "pytorch": [
       {
         "label": "B=1 T=1 H=3072",
-        "latency_ms": 0.2196,
-        "bandwidth_gb_s": 229.23,
+        "latency_ms": 0.2025,
+        "bandwidth_gb_s": 248.55,
         "batch": 1,
         "seq_len": 1,
-        "hidden": 3072
+        "hidden": 3072,
+        "tc_util_pct": 0.0
       },
       {
         "label": "B=1 T=128 H=3072",
-        "latency_ms": 0.2516,
-        "bandwidth_gb_s": 206.27,
+        "latency_ms": 0.2134,
+        "bandwidth_gb_s": 243.25,
         "batch": 1,
         "seq_len": 128,
-        "hidden": 3072
+        "hidden": 3072,
+        "tc_util_pct": 2.1
       },
       {
         "label": "B=1 T=512 H=3072",
-        "latency_ms": 0.2721,
-        "bandwidth_gb_s": 208.13,
+        "latency_ms": 0.2739,
+        "bandwidth_gb_s": 206.71,
         "batch": 1,
         "seq_len": 512,
-        "hidden": 3072
+        "hidden": 3072,
+        "tc_util_pct": 7.3
       },
       {
         "label": "B=1 T=2048 H=3072",
-        "latency_ms": 0.7899,
-        "bandwidth_gb_s": 95.58,
+        "latency_ms": 0.7853,
+        "bandwidth_gb_s": 96.14,
         "batch": 1,
         "seq_len": 2048,
-        "hidden": 3072
+        "hidden": 3072,
+        "tc_util_pct": 13.5
       }
     ]
   },
@@ -303,6 +307,64 @@
         "batch": 1,
         "seq_len": 1,
         "tokens_per_sec": 38.9
+      }
+    ]
+  },
+  "attention_kv": {
+    "pytorch": [
+      {
+        "label": "decode ctx=128",
+        "latency_ms": 0.2871,
+        "bandwidth_gb_s": 177.14,
+        "ctx_len": 128,
+        "batch": 1,
+        "prefill_equiv_ms": 0.2202,
+        "speedup_vs_prefill": 0.77
+      },
+      {
+        "label": "decode ctx=512",
+        "latency_ms": 0.2728,
+        "bandwidth_gb_s": 192.21,
+        "ctx_len": 512,
+        "batch": 1,
+        "prefill_equiv_ms": 0.2986,
+        "speedup_vs_prefill": 1.09
+      },
+      {
+        "label": "decode ctx=1024",
+        "latency_ms": 0.2969,
+        "bandwidth_gb_s": 183.67,
+        "ctx_len": 1024,
+        "batch": 1,
+        "prefill_equiv_ms": 0.4872,
+        "speedup_vs_prefill": 1.64
+      },
+      {
+        "label": "decode ctx=2048",
+        "latency_ms": 0.2608,
+        "bandwidth_gb_s": 225.2,
+        "ctx_len": 2048,
+        "batch": 1,
+        "prefill_equiv_ms": 1.0605,
+        "speedup_vs_prefill": 4.07
+      },
+      {
+        "label": "decode ctx=4096",
+        "latency_ms": 0.26,
+        "bandwidth_gb_s": 258.1,
+        "ctx_len": 4096,
+        "batch": 1,
+        "prefill_equiv_ms": 2.636,
+        "speedup_vs_prefill": 10.14
+      },
+      {
+        "label": "decode ctx=8192",
+        "latency_ms": 0.3861,
+        "bandwidth_gb_s": 217.3,
+        "ctx_len": 8192,
+        "batch": 1,
+        "prefill_equiv_ms": 6.6216,
+        "speedup_vs_prefill": 17.15
       }
     ]
   }
