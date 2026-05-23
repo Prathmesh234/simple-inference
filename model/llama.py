@@ -78,8 +78,9 @@ class LlamaModel(nn.Module):
                 head_dim=cfg.head_dim,
                 rope_freqs=self.rope_freqs,
                 norm_eps=cfg.rms_norm_eps,
+                layer_idx=i,
             )
-            for _ in range(cfg.num_hidden_layers)
+            for i in range(cfg.num_hidden_layers)
         ])
         # Final layer norm (applied after all 28 blocks)
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)

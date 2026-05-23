@@ -63,6 +63,7 @@ class TransformerBlock(nn.Module):
         head_dim: int,
         rope_freqs: RopeFrequencies,
         norm_eps: float = 1e-5,
+        layer_idx: int = 0,
     ):
         """
         Args:
@@ -73,9 +74,11 @@ class TransformerBlock(nn.Module):
             head_dim:          dimension per head (128)
             rope_freqs:        precomputed RoPE cos/sin tables
             norm_eps:          epsilon for RMSNorm (1e-5 or 1e-6)
+            layer_idx:         which transformer layer this is (for KV cache routing)
         """
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_idx   = layer_idx
 
         # Pre-attention norm
         self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
@@ -87,6 +90,7 @@ class TransformerBlock(nn.Module):
             num_heads_kv=num_heads_kv,
             head_dim=head_dim,
             rope_freqs=rope_freqs,
+            layer_idx=layer_idx,
         )
 
         # Pre-MLP norm
