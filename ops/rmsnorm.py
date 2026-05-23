@@ -27,8 +27,23 @@ Shape contract:
   output: (batch, seq_len, hidden_size)   same shape as input
 """
 
+import os
 import torch
 import torch.nn as nn
+
+# Triton kernel dispatch (Section 14a).
+#   Controlled by the USE_TRITON env var (set in .env or shell).
+#   Defaults to True — Triton is the production path. Set USE_TRITON=false
+#   to force the pure-PyTorch reference (useful for debugging / parity checks).
+USE_TRITON = os.environ.get("USE_TRITON", "true").lower() in ("1", "true", "yes", "on")
+
+
+def _pytorch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    input_dtype = x.dtype
+    x_f32 = x.float()
+    variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x_f32 * torch.rsqrt(variance + eps)
+    return x_normed.to(input_dtype) * weight
 
 
 class RMSNorm(nn.Module):
@@ -38,16 +53,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Keep input dtype for the output but compute variance in float32
-        # to avoid overflow with bfloat16 (bfloat16 max ~3.4e38, x² can explode)
-        input_dtype = x.dtype
-        x_f32 = x.float()
-
-        variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
-        x_normed = x_f32 * torch.rsqrt(variance + self.eps)
-
-        # Cast back and apply learned scale
-        return (x_normed.to(input_dtype)) * self.weight
+        if USE_TRITON and x.is_cuda:
+            from kernels.rmsnorm_kernel import rmsnorm_triton
+            return rmsnorm_triton(x, self.weight, self.eps)
+        return _pytorch_rmsnorm(x, self.weight, self.eps)
 
     def load_weight(self, weight: torch.Tensor):
         """Copy a tensor from the checkpoint into this module's parameter."""
