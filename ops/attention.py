@@ -66,6 +66,7 @@ class GroupedQueryAttention(nn.Module):
         num_heads_kv: int,
         head_dim: int,
         rope_freqs: RopeFrequencies,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.hidden_size  = hidden_size
@@ -74,6 +75,9 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim     = head_dim
         self.num_kv_groups = num_heads_q // num_heads_kv
         self.rope_freqs   = rope_freqs
+        # Needed so each block's attention writes into the right slot of the
+        # shared KVCache pool. Set at construction time by LlamaModel.
+        self.layer_idx    = layer_idx
 
         # Projection weights — no bias in Llama
         self.wq = nn.Parameter(torch.empty(num_heads_q  * head_dim, hidden_size))
@@ -114,9 +118,6 @@ class GroupedQueryAttention(nn.Module):
         q = q.view(B, T, self.num_heads_q,  self.head_dim)
         k = k.view(B, T, self.num_heads_kv, self.head_dim)
         v = v.view(B, T, self.num_heads_kv, self.head_dim)
-        print(f"Q shape - {q.shape}")
-        print(f"K shape - {k.shape}")
-        print(f"V shape - {v.shape}")
 
         # --- 3. Apply RoPE to Q and K ---
         cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos)
@@ -128,13 +129,13 @@ class GroupedQueryAttention(nn.Module):
         q = q.transpose(1, 2)  # (B, n_heads_q,  T, head_dim)
         k = k.transpose(1, 2)  # (B, n_heads_kv, T, head_dim)
         v = v.transpose(1, 2)  # (B, n_heads_kv, T, head_dim)
-        print(f"Q shape post transpose - {q.shape}")
-        print(f"K shape post transpose - {k.shape}")
-        print(f"V shape post transpose - {v.shape}")
 
-        # --- 5. KV cache update (no-op until Section 11) ---
+        # --- 5. KV cache update (Section 11) ---
+        # During prefill (start_pos=0): writes [0, T), returns [0, T) → standard self-attention.
+        # During decode (start_pos>0, T=1): writes [pos, pos+1), returns [0, pos+1)
+        # → the new query attends to the full cached prefix + itself.
         if kv_cache is not None:
-            k, v = kv_cache.update(layer_idx=self._layer_idx, k=k, v=v)
+            k, v = kv_cache.update(self.layer_idx, start_pos, k, v)
 
         # --- 6. Repeat KV heads to match Q head count (GQA) ---
         # Each KV head is reused by num_kv_groups Q heads
