@@ -4,13 +4,16 @@
     "seq_len_target": 256,
     "padding": "pad_to_longest_in_batch",
     "truncation": "right",
-    "sources": ["MT-Bench (lm-sys/FastChat)", "original multi-turn coding/QnA/debugging"],
+    "sources": [
+      "MT-Bench (lm-sys/FastChat)",
+      "original multi-turn coding/QnA/debugging"
+    ],
     "notes": "Workloads 1-3 have explicit sequences. Workloads 4-9 use a pool cycled to n_total."
   },
   "workloads": [
     {
       "id": "w1_single",
-      "label": "1 seq  (B=1  ×1 )",
+      "label": "1 seq  (B=1  \u00d71 )",
       "n_total": 1,
       "batch_size": 1,
       "sequences": [
@@ -19,7 +22,7 @@
     },
     {
       "id": "w2_small_batch",
-      "label": "8 seq  (B=8  ×1 )",
+      "label": "8 seq  (B=8  \u00d71 )",
       "n_total": 8,
       "batch_size": 8,
       "sequences": [
@@ -35,7 +38,7 @@
     },
     {
       "id": "w3_micro_batches",
-      "label": "24 seq (B=3  ×8 )",
+      "label": "24 seq (B=3  \u00d78 )",
       "n_total": 24,
       "batch_size": 3,
       "sequences": [
@@ -44,30 +47,30 @@
         "Describe the Raft consensus algorithm. Explain how leader election works, how the log replication safety property is maintained across network partitions, and why Raft is considered easier to understand than Paxos despite being equivalent in fault tolerance guarantees.",
         "In reinforcement learning from human feedback, the reward model is trained on pairwise preference data. Derive the Bradley-Terry loss function used to train it, explain what the log-odds ratio represents, and describe what happens when the reward model is over-optimized during PPO.",
         "A Bloom filter with m bits and k hash functions is used to represent a set of n elements. Derive the optimal value of k that minimizes the false positive rate, then compute the false positive probability for m=1e8, n=1e6, and your derived k.",
-        "Explain flash attention. Describe the tiling strategy used to avoid materializing the full N×N attention matrix, how online softmax normalization makes this possible, and why this reduces HBM memory accesses from O(N²) to O(N) while computing the exact same result.",
+        "Explain flash attention. Describe the tiling strategy used to avoid materializing the full N\u00d7N attention matrix, how online softmax normalization makes this possible, and why this reduces HBM memory accesses from O(N\u00b2) to O(N) while computing the exact same result.",
         "You are designing a tensor parallelism scheme for a 70B parameter transformer model across 8 GPUs. Describe how to split the attention and MLP weights, what all-reduce operations are needed, and estimate the communication volume per forward pass assuming bfloat16 and sequence length 2048.",
         "Derive the ELBO (Evidence Lower Bound) for a variational autoencoder from first principles. Show how it decomposes into a reconstruction term and a KL divergence term, explain what posterior collapse is, and describe at least two techniques to prevent it.",
         "A CUDA kernel for matrix multiplication achieves 40% of peak FLOPS on an A100. List five potential bottlenecks ranked by likelihood, explain how you would diagnose each using Nsight Compute profiling metrics, and describe the optimization strategy for the most common root cause.",
         "Describe the mathematical structure of rotary position embeddings (RoPE). Show why the inner product between a query at position m and a key at position n depends only on their relative offset m-n, and explain why this property makes RoPE compatible with KV cache reuse.",
         "The mixtral mixture-of-experts model routes each token to 2 out of 8 experts. Explain the sparse gating mechanism, derive the load balancing auxiliary loss, and analyze what happens to training stability when the router collapses to always selecting the same two experts.",
-        "In the context of speculative decoding, a small draft model proposes K tokens at once, which the large verifier model checks in a single forward pass. Derive the expected speedup as a function of the acceptance rate α, and explain why the output distribution remains identical to greedy decoding.",
+        "In the context of speculative decoding, a small draft model proposes K tokens at once, which the large verifier model checks in a single forward pass. Derive the expected speedup as a function of the acceptance rate \u03b1, and explain why the output distribution remains identical to greedy decoding.",
         "Explain the vanishing gradient problem in deep recurrent networks. Show the mathematical argument for why gradients decay exponentially with sequence length through repeated matrix multiplication, describe how the LSTM gating mechanism addresses this, and analyze why transformers sidestep the problem entirely.",
         "A key-value store must handle 1 million writes per second with durability guarantees. Compare B-trees and LSM trees for this workload: analyze write amplification, space amplification, and read performance for each structure, then justify your choice for an SSD-backed deployment.",
         "Derive the update rule for Adam optimizer from first principles. Explain what bias correction accomplishes in the early steps, why the effective learning rate is bounded regardless of gradient scale, and describe when Adam can fail to converge on simple convex problems.",
         "You are given a sequence-to-sequence model with cross-attention. Explain the information flow: what is the difference between self-attention in the encoder versus the decoder, why causal masking is applied only to the decoder, and how the cross-attention keys and values are computed.",
-        "The CKY algorithm parses context-free grammars in O(n³|G|) time. Describe the dynamic programming recurrence, explain how the chart is filled bottom-up, and analyze what grammatical structures cause pathological parsing times in practice for natural language CFGs.",
+        "The CKY algorithm parses context-free grammars in O(n\u00b3|G|) time. Describe the dynamic programming recurrence, explain how the chart is filled bottom-up, and analyze what grammatical structures cause pathological parsing times in practice for natural language CFGs.",
         "Describe the softmax bottleneck problem in language modeling. Show why a product of two low-rank matrices cannot express all possible next-token distributions over a large vocabulary, and explain how mixture of softmaxes and output embedding decomposition address this limitation.",
         "A streaming system processes 10 TB/day of event logs and must answer exact distinct-count queries over sliding 24-hour windows. Compare exact counting via hash sets, HyperLogLog approximation, and count-min sketch. Analyze the memory-accuracy trade-off for each and justify your production choice.",
         "In the context of neural architecture search, explain the DARTS algorithm. Describe how it relaxes the discrete architecture search space to a continuous one via softmax mixing of candidate operations, what bi-level optimization problem it solves, and why the found architectures tend to collapse to skip connections.",
         "Explain the mathematical relationship between dropout regularization and model ensembling at test time. Show why the expected output of a dropped-out network during training approximates a geometric mean over exponentially many thinned networks, and analyze the approximation error of the weight-scaling trick at inference.",
         "You must design a memory allocator for GPU tensor operations that minimizes fragmentation. Compare first-fit, best-fit, and buddy system allocation policies, explain how PyTorch's caching allocator works, and describe what stream-ordered memory allocation adds in CUDA 11.2.",
-        "The scaled dot-product attention is defined as softmax(QKᵀ/√d)V. Explain why the scaling factor 1/√d is necessary by analyzing the variance of the dot product as a function of dimension d, and show what happens to the softmax gradient when this factor is omitted.",
+        "The scaled dot-product attention is defined as softmax(QK\u1d40/\u221ad)V. Explain why the scaling factor 1/\u221ad is necessary by analyzing the variance of the dot product as a function of dimension d, and show what happens to the softmax gradient when this factor is omitted.",
         "Describe the mechanics of how a CPU branch predictor works. Explain the two-bit saturating counter scheme, how a branch history table is indexed, what branch prediction aliasing is, and why misprediction penalties are particularly costly on deep out-of-order execution pipelines."
       ]
     },
     {
       "id": "w4_medium",
-      "label": "128 seq(B=16 ×8 )",
+      "label": "128 seq(B=16 \u00d78 )",
       "n_total": 128,
       "batch_size": 16,
       "pool": [
@@ -80,7 +83,7 @@
         "A transformer model has embedding dimension 4096 and uses rotary position embeddings with base frequency 10000. Compute the periods of the lowest and highest frequency components of RoPE, and explain what context lengths can be handled without extrapolation artifacts.",
         "Describe the main algorithmic difference between BFS and DFS graph traversal. Show how changing a stack to a queue (or vice versa) switches between them, analyze their space complexity on a complete binary tree of depth d, and explain which is preferable for cycle detection in a dense graph.",
         "Explain what the Kolmogorov complexity of a string is and why it is uncomputable. Describe the connection to the halting problem, explain what incompressible strings are and how they relate to randomness, and show why the average-case Kolmogorov complexity of random strings is close to their length.",
-        "In the attention mechanism, the number of floating point operations for a sequence of length N and dimension d is O(N²d). For a modern GPU running at 300 TFLOPS BF16, at what sequence length does the attention computation take more than 1ms, assuming perfect hardware utilization?",
+        "In the attention mechanism, the number of floating point operations for a sequence of length N and dimension d is O(N\u00b2d). For a modern GPU running at 300 TFLOPS BF16, at what sequence length does the attention computation take more than 1ms, assuming perfect hardware utilization?",
         "Describe the CAP theorem for distributed systems. Provide a concrete example demonstrating the partition-availability trade-off, explain the PACELC extension that applies even without partitions, and analyze how CockroachDB and Cassandra position themselves differently along this spectrum.",
         "Explain the difference between Bayesian and frequentist interpretations of probability. Show how Bayes' theorem updates a prior distribution given observed data, and describe a scenario where the choice of prior dramatically changes the posterior despite having substantial data.",
         "A GPU program experiences high warp divergence. Explain what warps are, why all threads in a warp must execute the same instruction, how the hardware serializes divergent branches, and what code transformations reduce divergence for a sorting kernel over 32-thread tiles.",
@@ -91,7 +94,7 @@
         "Explain the intuition behind contrastive learning for self-supervised representation learning. Describe the InfoNCE loss, show why it maximizes mutual information between views, and analyze what the hardest negatives are and why they have the most impact on the quality of learned representations.",
         "In numerical linear algebra, explain why Gaussian elimination with partial pivoting is stable even though Gaussian elimination without pivoting can catastrophically amplify rounding errors. Provide a concrete 2x2 example demonstrating the failure mode and how pivoting corrects it.",
         "Describe the architecture of the CUDA memory hierarchy from registers through shared memory, L1/L2 cache, and global HBM. Explain the bandwidth and latency at each level, and show how a matrix transpose kernel can be optimized to avoid L1 cache thrashing using shared memory tiling.",
-        "Explain what activation checkpointing is in deep learning training. Describe the memory-compute trade-off it makes, show how it reduces memory from O(L) to O(√L) for L layers by selectively discarding and recomputing activations during the backward pass.",
+        "Explain what activation checkpointing is in deep learning training. Describe the memory-compute trade-off it makes, show how it reduces memory from O(L) to O(\u221aL) for L layers by selectively discarding and recomputing activations during the backward pass.",
         "A language model generates tokens autoregressively. For a sequence of 1024 tokens with vocabulary size 128256, compute the total number of logit values produced during generation, estimate their memory footprint in float32, and explain why keeping the full logit matrix in memory during beam search is expensive.",
         "Describe the Bellman-Ford algorithm for single-source shortest paths. Explain why it requires V-1 iterations in the worst case, how it detects negative cycles, and analyze when Dijkstra's algorithm is a better choice and what constraint on edge weights enables this.",
         "Explain the phenomenon of catastrophic forgetting in neural networks. Describe how elastic weight consolidation (EWC) uses the Fisher information matrix to identify important weights, show the regularization term it adds to the loss, and explain why this only partially solves the continual learning problem.",
@@ -107,7 +110,7 @@
     },
     {
       "id": "w5_large",
-      "label": "1024seq(B=32 ×32)",
+      "label": "1024seq(B=32 \u00d732)",
       "n_total": 1024,
       "batch_size": 32,
       "pool": [
@@ -147,7 +150,7 @@
     },
     {
       "id": "w6_xlarge",
-      "label": "2048seq(B=32 ×64)",
+      "label": "2048seq(B=32 \u00d764)",
       "n_total": 2048,
       "batch_size": 32,
       "pool": [
@@ -187,7 +190,7 @@
     },
     {
       "id": "w7_4k",
-      "label": "4096seq(B=64 ×64)",
+      "label": "4096seq(B=64 \u00d764)",
       "n_total": 4096,
       "batch_size": 64,
       "pool": [
@@ -227,7 +230,7 @@
     },
     {
       "id": "w8_8k",
-      "label": "8192seq(B=128×64)",
+      "label": "8192seq(B=128\u00d764)",
       "n_total": 8192,
       "batch_size": 128,
       "pool": [
@@ -241,7 +244,7 @@
         "User: When rolling two dice, what is the probability that you roll a total of at least 3?\nAssistant: [answer]\nUser: What is the probability of rolling a number which is even or at least 3? Show the inclusion-exclusion principle calculation and verify it numerically by listing all outcomes.",
         "User: Photosynthesis is vital for life on Earth. Outline the two main stages and their primary inputs and outputs.\nAssistant: [answer]\nUser: Explain C4 photosynthesis and why it evolved. Describe which environmental conditions make C4 plants more efficient than C3 plants, and name three commercially important C4 crops.",
         "User: Consider a satellite in circular orbit around Earth. Its speed decreases. What happens to the orbital radius and period?\nAssistant: [answer]\nUser: Using the vis-viva equation and Kepler's third law, derive quantitatively how the orbital period changes if the speed decreases by 10%. Show all steps.",
-        "User: Explain the difference between exothermic and endothermic reactions with a real-world example of each.\nAssistant: [answer]\nUser: For the combustion of methane CH4 + 2O2 → CO2 + 2H2O, calculate the enthalpy change using standard formation enthalpies and explain what the sign of delta-H tells us about energy flow.",
+        "User: Explain the difference between exothermic and endothermic reactions with a real-world example of each.\nAssistant: [answer]\nUser: For the combustion of methane CH4 + 2O2 \u2192 CO2 + 2H2O, calculate the enthalpy change using standard formation enthalpies and explain what the sign of delta-H tells us about energy flow.",
         "User: A is the father of B. B is the father of C. What is the relationship between A and C?\nAssistant: [answer]\nUser: If C is the son of D, D is the father of E, E is the son of X, and X is the father of A, then how is A related to X? Represent the full family tree and solve systematically.",
         "User: Imagine you are writing a blog comparing two smartphones. Develop an outline with key points and subheadings under 200 words.\nAssistant: [answer]\nUser: Expand the performance section of the outline into three detailed paragraphs covering CPU benchmarks, GPU performance for gaming, and thermal throttling behavior under sustained load.",
         "User: Explain what the P versus NP problem is and why it matters for cryptography.\nAssistant: [answer]\nUser: If P=NP were proven tomorrow, which specific cryptographic systems would immediately be broken and which would remain secure? Explain the complexity class assumptions each system relies on.",
@@ -267,7 +270,7 @@
     },
     {
       "id": "w9_16k",
-      "label": "16384seq(B=256×64)",
+      "label": "16384seq(B=256\u00d764)",
       "n_total": 16384,
       "batch_size": 256,
       "pool": [
