@@ -299,7 +299,7 @@ Steps:
 
 ---
 
-## Section 13 — Generation Loop + Full Benchmark Suite
+## ✅ Section 13 — Generation Loop + Full Benchmark Suite  `DONE`
 
 **File:** `generate.py`
 
@@ -329,15 +329,19 @@ def generate(prompt, model, tokenizer, kv_cache, max_new_tokens,
 
 **Rule:** one kernel per PR. Swap it in, re-run `benchmarks/run_baseline.py`, compare the delta.
 
-### 14a — RMSNorm kernel  `kernels/rmsnorm_kernel.py`
+### 14a — RMSNorm kernel  `kernels/rmsnorm_kernel.py`  ✅ DONE
 - One Triton program per row
 - Accumulate sum-of-squares in a loop over tiles, compute scale, write output in one pass
 - Expected win: moderate — RMSNorm is memory-bound, kernel fusion eliminates one read+write round-trip
+- **Result: 3.5–7.8× speedup, 81% of peak BW at T=8192. Autotuned (warps=8, stages=3-4).**
 
-### 14b — SwiGLU fusion kernel  `kernels/swiglu_kernel.py`
-- Fuse `silu(gate) * up` into one element-wise kernel
-- Without fusion: two separate reads of the intermediate tensor; with fusion: one
-- Expected win: meaningful — this is the most fusion-friendly op in the stack
+### 14b — SwiGLU fusion kernel  `kernels/swiglu_kernel.py`  ✅ DONE
+- **Level 1** (activation fusion): fused `silu(gate) * up` into one Triton kernel
+  - Result: 1.3–1.7× on the isolated step (84% of peak BW); 1–6% end-to-end MLP gain since GEMMs dominate. Autotuned (BLOCK_SIZE=2048, warps=4).
+- **Level 2** (gate+up matmul concat): single `w_gate_up` of shape `(2*I, H)`, one fused GEMM + chunk(2)
+  - Result on RTX 6000 Ada single-GPU bf16: **wash (0.95×–1.02×)**. cuBLAS launches are ~5µs and tile utilization is already saturated at these shapes.
+  - Kept anyway — this is the production pattern (vLLM, SGLang, TensorRT-LLM all do this). The win materializes under tensor parallelism (fewer all-gathers), CUDA graphs (fewer ops in graph), and quantization (fewer dequant kernels).
+- **Level 3/4** (matmul+activation epilogue, fuse down matmul): deferred — requires beating cuBLAS at GEMM, multi-week project.
 
 ### 14c — RoPE kernel  `kernels/rope_kernel.py`
 - Apply cos/sin rotation to Q and K in a single fused kernel
