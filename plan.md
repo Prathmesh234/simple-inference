@@ -909,7 +909,7 @@ Target models (single-GPU on 48 GB Ada, with §21 quantization):
 
 We deliberately stay with **dense** transformers — no MoE in this phase.
 Sparse models change the parallelism story; we cover that separately in
-Phase 5.
+Phase 6.
 
 ---
 
@@ -958,13 +958,196 @@ produce a comparison matrix:
 
 Every Phase-3 optimization (paged, radix, chunked, graphs, speculation,
 quant) must be on simultaneously. If any single one regresses for a
-specific model family, that's the bug to fix before Phase 5.
+specific model family, that's the bug to fix before Phase 6.
 
 **Learned:** how engine performance characteristics shift with model size — what was decode-latency-bound at 3B may become weight-memory-bound at 32B.
 
 ---
 
-## Phase 5 — Multi-GPU Parallelism  *(only after Phase 4 works)*
+## Phase 5 — Distributed Serving with Ray  *(production layer)*
+
+> Up to here the engine is a Python object you call from a script. Phases 1–4
+> made it *fast* and *general*; they did not make it a *service*. Phase 5 turns
+> the in-process engine into a long-running, fault-tolerant, horizontally
+> scalable service — without changing a line of the model or scheduler code.
+>
+> **Why Ray:** it is the de-facto orchestration substrate for production LLM
+> serving (vLLM and friends drive their distributed workers as Ray actors). It
+> gives us three things we don't want to hand-roll: (1) a stateful **actor**
+> model so the engine loop lives in its own process with its own GPU, (2) **Ray
+> Serve** for HTTP/streaming ingress, replicas, and autoscaling, and (3) a clean
+> path into Phase 6 — multi-GPU workers become just more actors under a
+> placement group.
+>
+> **Scope discipline:** one GPU per engine actor here. We are NOT sharding a
+> model across GPUs yet (that's Phase 6). We ARE running N independent engine
+> replicas behind one API, each serving the whole model. Everything from
+> Phases 1–4 keeps working *unchanged* inside the actor — this phase is a
+> wrapper, not a rewrite.
+
+---
+
+## Section 26 — Engine as a Ray Actor
+
+**Builds on:** all of Phase 3 (the `InferenceEngine`), and Phase 4 if serving the larger models.
+
+**Files:** `serving/ray_engine.py`
+
+**Problem it solves**
+The Phase 3 `InferenceEngine` is a synchronous object: you call `step()` in a
+loop on the main thread. To serve concurrent clients the engine loop must run
+continuously in its own process, own its GPU, hold the KV cache and scheduler
+state across requests, and accept/stream requests asynchronously. That is
+exactly a stateful actor.
+
+**Solution: wrap the engine in a long-lived async actor**
+- `@ray.remote(num_gpus=1)` actor owns one `InferenceEngine` (model + KV cache + scheduler)
+- An async background task drives `engine.step()` continuously while there is work, and sleeps when idle
+- `generate()` enqueues into the scheduler and returns an async stream of tokens
+- Per-token outputs are pushed back to callers via per-request `asyncio.Queue`s
+
+```python
+@ray.remote(num_gpus=1)
+class EngineActor:
+    def __init__(self, model_id, engine_config):
+        self.engine = InferenceEngine(...)          # Phase 3 engine, unchanged
+        self._streams: dict[int, asyncio.Queue] = {}
+        self._wakeup = asyncio.Event()
+
+    async def _run_loop(self):
+        while True:
+            if self.engine.idle():
+                await self._wakeup.wait(); self._wakeup.clear()
+            outputs = self.engine.step()            # one scheduler iteration
+            for req_id, tok in outputs.items():
+                self._streams[req_id].put_nowait(tok)
+
+    async def generate(self, prompt_tokens, params):   # async generator
+        req_id = self.engine.add_request(prompt_tokens, params)
+        self._streams[req_id] = asyncio.Queue()
+        self._wakeup.set()
+        async for tok in self._drain(req_id):
+            yield tok
+```
+
+**Steps**
+- Add `ray` to deps; `ray.init()` local bring-up
+- Wrap `InferenceEngine` in `EngineActor`; move the `step()` loop into an async task
+- Make `add_request` safe to call from RPC handlers while the loop is running (the scheduler is now touched from two places)
+- Stream tokens out via per-request `asyncio.Queue`; clean up state on completion/cancel
+- Verify: generations are bit-identical to the in-process Phase 3 engine on the five workloads
+
+**Benchmark (iteration `20_ray_engine.py`):**
+Run the five workloads through the actor. Compare against the in-process engine —
+the delta is pure actor/serialization overhead.
+
+**Expected win:** none on raw throughput — this is a *refactor*, not an
+optimization. Target: actor overhead < a few %, and the engine now runs detached
+from the caller. That decoupling is the deliverable.
+
+**Learned:** stateful actors, the async-loop-plus-queue pattern every production
+engine uses (vLLM's `AsyncLLMEngine` is exactly this), why the serving loop must
+be decoupled from request submission.
+
+---
+
+## Section 27 — Ray Serve Production API
+
+**Builds on:** Section 26.
+
+**Files:** `serving/ray_serve_app.py`, `serving/openai_schema.py`
+
+**Problem it solves**
+An actor handle is still an in-cluster Python API. Real clients speak HTTP, want
+token streaming (SSE), expect an OpenAI-compatible schema so existing tooling
+"just works", and the service must scale replicas up/down with load and survive
+a worker crash.
+
+**Solution: a Ray Serve deployment in front of the engine actor(s)**
+- An ingress deployment exposes `/v1/chat/completions` and `/v1/completions` (OpenAI-compatible), with SSE streaming
+- It applies the chat template, validates, routes to an `EngineActor` replica, and streams tokens back
+- Autoscaling config scales engine replicas with load; health checks + automatic restart give fault tolerance
+- Ingress (CPU-bound: tokenization, templating) and engine (GPU-bound) are *separate* deployments so they scale independently
+
+```python
+@serve.deployment(autoscaling_config={"min_replicas": 1, "max_replicas": 4},
+                  ray_actor_options={"num_gpus": 1})
+class EngineReplica:
+    def __init__(self):
+        self.engine = EngineActor.remote(...)
+    async def stream(self, prompt_tokens, params):
+        async for tok in self.engine.generate.remote(prompt_tokens, params):
+            yield tok
+
+@serve.deployment
+@serve.ingress(app)                                  # FastAPI app
+class OpenAIIngress:
+    @app.post("/v1/chat/completions")
+    async def chat(self, body: ChatRequest):
+        toks = self.tokenizer.apply_chat_template(body.messages)
+        return StreamingResponse(self._sse(self.engine.stream(toks, body.params)))
+```
+
+**Steps**
+- Define OpenAI-compatible request/response models (chat + completions) in `openai_schema.py`
+- Build the FastAPI ingress; wire SSE streaming for `stream=true`
+- Bind ingress → `EngineReplica`; set autoscaling target (e.g. on ongoing-requests / queue depth)
+- Apply the tokenizer chat template at the ingress (keep the engine token-only)
+- Verify: the `openai` Python client and `curl` both stream correctly; multiple concurrent clients are served
+
+**Benchmark (iteration `21_ray_serve.py`):**
+Closed-loop load test (async client / locust): requests/sec, TTFT and
+inter-token-latency distributions at 1 / 8 / 32 / 128 concurrent clients;
+autoscaling reaction time as load ramps up and down.
+
+**Expected win:** this is about *serving*, not tok/s — confirm HTTP+SSE overhead
+is small vs generation time, throughput scales ~linearly with replicas until
+GPU-bound, and the API is drop-in OpenAI-compatible.
+
+**Learned:** Ray Serve deployments/replicas/ingress, the OpenAI API surface, SSE
+streaming, autoscaling on serving signals, why ingress and engine are split into
+separate deployments.
+
+---
+
+## Section 28 — Observability & Production Hardening
+
+**Builds on:** Section 27.
+
+**Files:** `serving/metrics.py`, `serving/production.py`
+
+**Problem it solves**
+A service you can't see into isn't production-ready. You need per-request and
+per-replica metrics, graceful shutdown that drains in-flight requests,
+backpressure when overloaded (shed/queue rather than OOM), and request
+cancellation when a client disconnects mid-stream (free its KV blocks
+immediately, not at EOS).
+
+**Solution: instrument and harden the serving layer**
+- **Metrics:** TTFT, ITL, tokens/sec, queue depth, running/waiting counts, KV-cache utilization, GPU memory — exported to Prometheus (Ray ships a metrics endpoint), with a Grafana panel set
+- **Backpressure:** cap admitted requests / total KV budget; past the limit return 429 (or queue with a timeout) instead of OOMing
+- **Graceful drain:** on `SIGTERM`, stop admitting, finish in-flight requests, then tear down actors
+- **Cancellation:** client disconnect → cancel the request → scheduler evicts it and frees KV blocks the same step
+
+**Steps**
+- Emit metrics from the engine loop (cheap counters/histograms; sample — never log per token in the hot path)
+- Add a Prometheus scrape target; sketch the four golden signals + KV utilization panel
+- Implement backpressure in the admission path
+- Wire client-disconnect → request cancellation → KV free
+- Implement graceful drain
+
+**Benchmark / validation:**
+- **Overload test** past capacity → service sheds load (429s, bounded latency) instead of OOMing or melting tail latency
+- **Kill an engine actor** mid-load → Serve restarts it; in-flight requests on healthy replicas are unaffected
+- **Disconnect a streaming client** → its KV blocks free within one step
+
+**Learned:** the four golden signals for an inference service, backpressure vs
+graceful degradation, why request cancellation is a memory-management concern in
+LLM serving, what "production-ready" requires beyond raw speed.
+
+---
+
+## Phase 6 — Multi-GPU Parallelism  *(only after Phase 4 works)*
 
 Single-node, 2 or 4 GPU configurations (NVLink between RTX 6000 Ada cards,
 or the next-tier hardware we move to). **All earlier phases continue to
@@ -976,7 +1159,7 @@ surface area for marginal pedagogical gain.
 
 ---
 
-## Section 26 — Tensor Parallelism  *(weight split across GPUs)*
+## Section 29 — Tensor Parallelism  *(weight split across GPUs)*
 
 **Builds on:** all of Phases 1–4.
 
@@ -1022,9 +1205,9 @@ Compare: prefill throughput, decode latency, peak VRAM per GPU.
 
 ---
 
-## Section 27 — Custom All-reduce for Decode  *(small-message latency killer)*
+## Section 30 — Custom All-reduce for Decode  *(small-message latency killer)*
 
-**Builds on:** Section 26.
+**Builds on:** Section 29.
 
 **Files:** `parallel/custom_ar.py`, `kernels/all_reduce_kernel.py`
 
@@ -1059,9 +1242,9 @@ Single-token decode latency on a TP=2 32B model, NCCL vs custom AR.
 
 ---
 
-## Section 28 — Sequence Parallelism  *(halves activation memory in TP)*
+## Section 31 — Sequence Parallelism  *(halves activation memory in TP)*
 
-**Builds on:** Section 26.
+**Builds on:** Section 29.
 
 **Files:** `parallel/sp.py`
 
@@ -1088,9 +1271,9 @@ activations along the **sequence dimension** instead of replicating them.
 
 ---
 
-## Section 29 — Two-batch Overlap  *(hide collectives under compute)*
+## Section 32 — Two-batch Overlap  *(hide collectives under compute)*
 
-**Builds on:** Sections 26–28.
+**Builds on:** Sections 29–31.
 
 **Files:** `parallel/tbo.py`
 
@@ -1118,7 +1301,7 @@ Stream 1 (comm):           [A.L0]      [B.L0]      [A.L1]     ...
 
 ---
 
-## Section 30 — Pipeline & Expert Parallelism  *(optional)*
+## Section 33 — Pipeline & Expert Parallelism  *(optional)*
 
 **Pipeline parallelism (PP)** — split *layers* across GPUs, micro-batch the
 input, pipeline forward passes. Useful only when TP saturates intra-node
@@ -1172,12 +1355,17 @@ Phase 4 — Dense model expansion (beyond Llama-3.2-3B)
   Section 24     model/dense_lm.py            generic dense-LM support (Llama 8B/Qwen 14B/32B/…)
   Section 25     benchmarks/run_dense_suite.py cross-model validation matrix
 
-Phase 5 — Multi-GPU parallelism (single-node, 2 or 4 GPU)
-  Section 26     parallel/tp.py               tensor parallelism (Megatron split)
-  Section 27     parallel/custom_ar.py        custom all-reduce for decode
-  Section 28     parallel/sp.py               sequence parallelism
-  Section 29     parallel/tbo.py              two-batch overlap (comm/compute)
-  Section 30     parallel/{pp,ep}.py          pipeline / expert parallelism (optional)
+Phase 5 — Distributed serving with Ray (production layer)
+  Section 26     serving/ray_engine.py        engine as a Ray actor (async loop)
+  Section 27     serving/ray_serve_app.py     Ray Serve OpenAI-compatible API + autoscaling
+  Section 28     serving/production.py        observability + production hardening
+
+Phase 6 — Multi-GPU parallelism (single-node, 2 or 4 GPU)
+  Section 29     parallel/tp.py               tensor parallelism (Megatron split)
+  Section 30     parallel/custom_ar.py        custom all-reduce for decode
+  Section 31     parallel/sp.py               sequence parallelism
+  Section 32     parallel/tbo.py              two-batch overlap (comm/compute)
+  Section 33     parallel/{pp,ep}.py          pipeline / expert parallelism (optional)
 ```
 
 ---
@@ -1233,11 +1421,15 @@ iterations/
   18_dense_lm_14b.py            same engine as 15, target = Qwen2.5-14B (BF16 / W8A16)
   19_dense_lm_32b.py            same engine as 15, target = Qwen2.5-32B (W4A16 required)
 
-  ── Phase 5: multi-GPU (run via torchrun, 2–4 processes) ──
-  20_tp.py                      tensor parallelism (Section 26)
-  21_tp_custom_ar.py            + custom all-reduce (Section 27) — built on 20
-  22_tp_sp.py                   + sequence parallelism (Section 28) — built on 21
-  23_tp_tbo.py                  + two-batch overlap (Section 29) — built on 22
+  ── Phase 5: distributed serving with Ray (production layer) ──
+  20_ray_engine.py              engine wrapped as a Ray actor (Section 26)
+  21_ray_serve.py               Ray Serve OpenAI-compatible API + autoscaling (Section 27)
+
+  ── Phase 6: multi-GPU (run via torchrun, 2–4 processes) ──
+  22_tp.py                      tensor parallelism (Section 29)
+  23_tp_custom_ar.py            + custom all-reduce (Section 30) — built on 22
+  24_tp_sp.py                   + sequence parallelism (Section 31) — built on 23
+  25_tp_tbo.py                  + two-batch overlap (Section 32) — built on 24
 ```
 
 **Why 09 and 10 fork from 08 independently:** PagedAttention and RadixAttention
@@ -1272,8 +1464,10 @@ across **all** iterations.
 - `14 → 15`: sustained-decode GPU SM utilization climbs ~60 % → ~95 %
 - `15 → 16`: TTFT under mixed prefill/decode load improves (disaggregation)
 - `16 → 17–19`: same engine code, model size sweep — performance characteristics shift from latency-bound (3B) to weight-memory-bound (32B)
-- `19 → 20`: enables models that don't fit on one GPU; per-GPU decode latency typically *increases* — TP is a capacity tool
-- `20 → 21–23`: each multi-GPU optimization claws back the latency TP costs
+- `19 → 20`: engine logic unchanged, now driven inside a Ray actor — measure actor/serialization overhead (target < a few %); the serving refactor should be ~free
+- `20 → 21`: add the Ray Serve HTTP/SSE ingress — measure API overhead and replica autoscaling under concurrent clients (serving metrics, not the five-workload engine bench)
+- `21 → 22`: enables models that don't fit on one GPU; per-GPU decode latency typically *increases* — TP is a capacity tool
+- `22 → 23–25`: each multi-GPU optimization claws back the latency TP costs
 
 ---
 
@@ -1287,8 +1481,9 @@ across **all** iterations.
 - Not structured-output decoding (JSON schema / XGrammar / Outlines)
 
 Phases 1–3 give us the engine. Phase 4 generalizes it across dense models.
-Phase 5 scales it across GPUs. The goal — **phenomenal performance on
-dense models** — is met when the Phase 5 engine, running a 30B-class dense
+Phase 5 turns it into a production service with Ray. Phase 6 scales it across
+GPUs. The goal — **phenomenal performance on dense models** — is met when the
+Phase 6 engine, running a 30B-class dense
 model under W4A16 + FP8-KV + speculative decoding + paged attention +
 radix prefix caching + CUDA graphs + TP-2, beats a stock vLLM/SGLang
 deployment on the same hardware on at least one workload class. That's the bar.
