@@ -59,7 +59,14 @@ apply_rope:
 """
 
 import math
+import os
 import torch
+
+# Triton kernel dispatch (Section 14c).
+#   Controlled by the USE_TRITON env var (set in .env or shell).
+#   Defaults to True — Triton is the production path. Set USE_TRITON=false
+#   to force the pure-PyTorch reference (useful for debugging / parity checks).
+USE_TRITON = os.environ.get("USE_TRITON", "true").lower() in ("1", "true", "yes", "on")
 
 
 class RopeFrequencies:
@@ -193,6 +200,10 @@ def apply_rope(
     Returns:
         q_rot, k_rot — same shapes as input
     """
+    if USE_TRITON and q.is_cuda:
+        from kernels.rope_kernel import rope_triton
+        return rope_triton(q, k, cos, sin)
+
     # Broadcast cos/sin over batch and head dimensions
     # (seq_len, head_dim) → (1, seq_len, 1, head_dim)
     cos = cos.unsqueeze(0).unsqueeze(2)

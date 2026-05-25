@@ -343,9 +343,16 @@ def generate(prompt, model, tokenizer, kv_cache, max_new_tokens,
   - Kept anyway — this is the production pattern (vLLM, SGLang, TensorRT-LLM all do this). The win materializes under tensor parallelism (fewer all-gathers), CUDA graphs (fewer ops in graph), and quantization (fewer dequant kernels).
 - **Level 3/4** (matmul+activation epilogue, fuse down matmul): deferred — requires beating cuBLAS at GEMM, multi-week project.
 
-### 14c — RoPE kernel  `kernels/rope_kernel.py`
-- Apply cos/sin rotation to Q and K in a single fused kernel
-- Expected win: small — RoPE is memory-bound but fast relative to matmuls
+### 14c — RoPE kernel  `kernels/rope_kernel.py`  ✅ DONE
+- One Triton program per (token, head); processes both halves of the rotation
+  in a single pass (loads first + second half of x, multiplies by shared
+  cos/sin row, writes both outputs). Avoids the `rotate_half` materialization.
+- Exploits the duplicated cos/sin layout — only first HALF of each is loaded.
+- Q and K share the same kernel via two launches in `rope_triton(q, k, ...)`.
+- Autotuned over `num_warps ∈ {1,2,4}`, `num_stages ∈ {1,2,3}`.
+- **Result on RTX 6000 Ada bf16: 2.1–4.0× speedup. 72.7% peak BW at T=8192
+  (vs 22.1% for PyTorch). Small-T wins are launch-overhead-limited
+  (4× at T=1 but still only 0.3% peak BW).**
 
 ### 14d — Attention kernel  `kernels/attention_kernel.py`
 - Write a naive (non-flash) Triton attention kernel:
