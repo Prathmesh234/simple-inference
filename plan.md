@@ -374,6 +374,39 @@ Re-run `benchmarks/run_baseline.py` with all kernels active.
 Print side-by-side: baseline vs Triton, delta per op, overall tokens/sec improvement.  
 Plot the roofline: is each op compute-bound or memory-bound on RTX 6000 Ada (960 GB/s bandwidth, 1457 TFLOPS BF16)?
 
+### 14f — Profiling kernels with Nsight Systems  `benchmarks/profile_kernel.py`
+**Goal:** capture a real profiler timeline for a kernel even though the VM is
+headless. `nsys` writes a self-contained `.nsys-rep` report file — you don't
+need the GUI on the VM. Run the profiler on the GPU, **download the file**, and
+open it locally in the Nsight Systems GUI (**File → Open**). Nothing GPU-side
+ever has to touch your machine.
+
+**Script:** `benchmarks/profile_kernel.py` wraps `nsys profile` around a single
+kernel so the only thing in the trace is the op you care about. It:
+1. builds Llama 3.2-3B-shaped inputs on the GPU,
+2. warms up first so the one-time Triton autotune sweep does **not** pollute the
+   timeline,
+3. runs the kernel `--iters` times inside a named NVTX range so the hot loop is
+   trivial to find.
+
+```bash
+# on the GPU VM
+python benchmarks/profile_kernel.py --kernel rmsnorm
+python benchmarks/profile_kernel.py --kernel swiglu --iters 200
+python benchmarks/profile_kernel.py --kernel rope --seq-len 2048 --out rope_2k
+# → writes profile_<kernel>.nsys-rep ; download it and open in Nsight Systems
+```
+
+Supported kernels: `rmsnorm`, `swiglu`, `rope`. Flags: `--seq-len` (T, default
+512), `--iters` (hot-loop count, default 100), `--out` (basename, default
+`profile_<kernel>`).
+
+**What to look at in the GUI:** the NVTX range marks the hot loop; inside it
+check the per-kernel duration, gaps between launches (launch-overhead / CPU
+bound at small T), and the CUDA HW row for actual GPU occupancy. For per-kernel
+counters (warp occupancy, memory throughput, etc.) you'd reach for Nsight
+**Compute** (`ncu`) instead — Nsight Systems is the system-level timeline.
+
 ---
 
 ## Phase 3 — Serving Optimizations (Sections 15–19)
