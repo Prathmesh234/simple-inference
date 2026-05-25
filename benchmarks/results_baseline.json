@@ -161,8 +161,8 @@
     "pytorch": [
       {
         "label": "B=1 T=1 H=128",
-        "latency_ms": 0.0246,
-        "bandwidth_gb_s": 0.69,
+        "latency_ms": 0.0247,
+        "bandwidth_gb_s": 0.68,
         "batch": 1,
         "seq_len": 1,
         "head_dim": 128,
@@ -171,7 +171,7 @@
       {
         "label": "B=1 T=128 H=128",
         "latency_ms": 0.0319,
-        "bandwidth_gb_s": 67.89,
+        "bandwidth_gb_s": 67.73,
         "batch": 1,
         "seq_len": 128,
         "head_dim": 128,
@@ -180,7 +180,7 @@
       {
         "label": "B=1 T=512 H=128",
         "latency_ms": 0.0539,
-        "bandwidth_gb_s": 160.45,
+        "bandwidth_gb_s": 160.43,
         "batch": 1,
         "seq_len": 512,
         "head_dim": 128,
@@ -188,8 +188,8 @@
       },
       {
         "label": "B=1 T=2048 H=128",
-        "latency_ms": 0.1252,
-        "bandwidth_gb_s": 276.41,
+        "latency_ms": 0.1254,
+        "bandwidth_gb_s": 275.86,
         "batch": 1,
         "seq_len": 2048,
         "head_dim": 128,

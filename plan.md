@@ -345,14 +345,22 @@ def generate(prompt, model, tokenizer, kv_cache, max_new_tokens,
 
 ### 14c — RoPE kernel  `kernels/rope_kernel.py`  ✅ DONE
 - One Triton program per (token, head); processes both halves of the rotation
-  in a single pass (loads first + second half of x, multiplies by shared
-  cos/sin row, writes both outputs). Avoids the `rotate_half` materialization.
-- Exploits the duplicated cos/sin layout — only first HALF of each is loaded.
+  in a single pass — no `rotate_half` materialization.
+- **Model-agnostic:** `INTERLEAVED` constexpr selects pair layout at compile
+  time. Supports NEOX-style split-half (Llama, Mistral, Qwen, Yi, DeepSeek,
+  Phi-3) and GPT-J adjacent-pair (GPT-J, GPT-NeoX-original, ChatGLM).
+- Accepts cos/sin in either `(T, head_dim)` (HF duplicated) or `(T, head_dim/2)`
+  (raw) layout via a runtime row stride. Zero-copy — no slice + contiguous.
 - Q and K share the same kernel via two launches in `rope_triton(q, k, ...)`.
 - Autotuned over `num_warps ∈ {1,2,4}`, `num_stages ∈ {1,2,3}`.
 - **Result on RTX 6000 Ada bf16: 2.1–4.0× speedup. 72.7% peak BW at T=8192
   (vs 22.1% for PyTorch). Small-T wins are launch-overhead-limited
   (4× at T=1 but still only 0.3% peak BW).**
+- **Optimization attempts tried and rejected:**
+  - *Multi-head per program* (`BLOCK_H` tile to amortize cos/sin loads):
+    regressed T=128–2048 (2.13× vs 3.29×). cos/sin is only ~5–10% of total
+    traffic so the saving was real but the 2D indexing/masking overhead
+    in Triton dominated. Reverted.
 
 ### 14d — Attention kernel  `kernels/attention_kernel.py`
 - Write a naive (non-flash) Triton attention kernel:
