@@ -325,6 +325,92 @@ def generate(prompt, model, tokenizer, kv_cache, max_new_tokens,
 
 ---
 
+## Section 13.5 — Profiling  (torch.profiler → nsys → ncu)
+
+The benchmarks in Section 13 tell you *how fast*. Profiling tells you *where time goes and why* — the input to every kernel decision in Section 14.
+
+**Rule:** always warm up before profiling. The first few iterations carry cuDNN/cuBLAS plan selection and Triton JIT compilation — one-time costs that inflate every op's apparent latency by 10–100×. Discard at least 5 steps before capturing.
+
+### Step 1 — torch.profiler basic (simple, no setup)
+
+Wrap a forward pass in `torch.profiler.profile` and call `key_averages().table(sort_by="cuda_time_total")`.
+
+- Read `cuda_time_total` (total GPU time including children) vs `self_cuda_time_total` (own GPU time, excluding child ops) — the difference isolates which *level* the cost sits at
+- Profile prefill and decode separately: they have completely different op distributions — prefill is large matmul tiles, decode is short memory-bound kernels with visible gaps
+- `aten::mm` / `aten::bmm` = raw matmul; `aten::scaled_dot_product_attention` = fused SDPA
+
+### Step 2 — Schedule + TensorBoard + record_function
+
+Use `schedule(wait=1, warmup=1, active=3)` so the profiler automatically skips initialization and only keeps clean steady-state steps. Pair with `on_trace_ready=tensorboard_trace_handler(log_dir)` to write a `.pt.trace.json` per cycle.
+
+- `record_function("prefill")` / `record_function("decode_step_N")` — named spans appear in TensorBoard's timeline view and in `key_averages()` with their own timing row
+- `record_shapes=True` enables `key_averages(group_by_input_shape=True)` — shows how the same matmul changes from prefill (large T) to decode (T=1)
+- `with_flops=True` — profiler estimates FLOPs for matmul/conv; divide by latency to get achieved TFLOPS for roofline analysis
+
+Launch TensorBoard: `tensorboard --logdir=<log_dir>`
+
+### Step 3 — Chrome trace + memory profiling
+
+`prof.export_chrome_trace("trace.json")` — open in `chrome://tracing` or `ui.perfetto.dev`. Shows the raw GPU stream timeline: kernel names, start times, durations. Prefill shows long matmul tiles back-to-back; decode shows short kernels separated by memory-latency gaps — that visual difference is the compute-bound vs memory-bound distinction made concrete.
+
+Add `profile_memory=True` to track tensor allocations per op. Sort `key_averages()` by `cuda_memory_usage` to find which op allocates the most.
+
+For deeper memory investigation, use the snapshot API separately:
+```
+torch.cuda.memory._record_memory_history(max_entries=100_000)
+<run forward>
+torch.cuda.memory._dump_snapshot("snapshot.pickle")
+```
+Upload the `.pickle` to `pytorch.org/memory_viz` — shows which tensor holds how much memory and the Python stack that allocated it.
+
+`with_stack=True` adds Python call stacks to the Chrome trace so you can click any kernel and trace it back to the exact Python line. Expensive (~30% overhead); use only when you need stack attribution.
+
+### Step 4 — Nsight Systems (nsys) + NVTX
+
+nsys captures the hardware timeline: SM occupancy, memory bandwidth per kernel, kernel-to-kernel gaps, NVLink traffic. More detail than torch.profiler on the GPU side; no Python op table.
+
+Annotate code with NVTX ranges so nsys shows your logical regions alongside raw kernel names:
+```
+torch.cuda.nvtx.range_push("prefill_T256")
+model(ids, start_pos=0)
+torch.cuda.nvtx.range_pop()
+```
+
+**Critical:** call `torch.cuda.cudart().cudaProfilerStart()` / `cudaProfilerStop()` around the measured region and run nsys with `--capture-range=cudaProfilerApi`. Without this, nsys captures model load and warmup, producing a huge trace where the inference region is buried.
+
+```
+nsys profile --trace=cuda,nvtx,osrt \
+             --capture-range=cudaProfilerApi \
+             --output=<outfile> \
+             python script.py
+```
+
+What to look for in nsys:
+- Gaps between CUDA kernels during decode = memory latency stalls → the op is memory-bound
+- Short, dense kernels during prefill = compute-bound → look at SM occupancy
+- CPU thread timeline above GPU: if CPU is the last to finish each step, Python dispatch is the bottleneck (→ CUDA graphs, Section 19)
+
+For single-kernel deep-dive after identifying the bottleneck in nsys:
+```
+ncu --set full -o kernel_report python script.py
+```
+`ncu` reports cache hit rates, register usage, warp efficiency, and memory throughput for one kernel at a time. Use it only after nsys tells you *which* kernel to target.
+
+**Tool decision guide:**
+
+| Question | Tool |
+|---|---|
+| Which op takes the most time? | torch.profiler `key_averages` |
+| Is the op compute-bound or memory-bound? | nsys SM occupancy + kernel gaps |
+| Which tensor is eating VRAM? | memory snapshot → `pytorch.org/memory_viz` |
+| Is Python dispatch the bottleneck? | nsys CPU thread vs GPU stream comparison |
+| How many FLOPs per op? | torch.profiler `with_flops=True` |
+| Why is this kernel slow internally? | ncu register / cache / warp metrics |
+
+**Learned:** warmup discipline, schedule API for clean traces, `self_cuda_time` vs `cuda_time` distinction, how prefill and decode look visually different in every tool, NVTX as the bridge from Python logic to hardware timelines, nsys → ncu as the two-step drill-down for kernel optimization.
+
+---
+
 ## Section 14 — Triton Kernels (one at a time)
 
 **Rule:** one kernel per PR. Swap it in, re-run `benchmarks/run_baseline.py`, compare the delta.
