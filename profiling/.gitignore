@@ -1,0 +1,8 @@
+traces/
+tb_logs/
+nsys_output/
+*.nsys-rep
+*.sqlite
+*.qdrep
+*.ncu-rep
+*.pickle
