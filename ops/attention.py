@@ -51,11 +51,19 @@ Forward pass shape flow
   → out = x @ wo.T           (B, T, hidden)
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ops.rope import RopeFrequencies, apply_rope
+
+# Triton kernel dispatch (Section 14d).
+#   Controlled by the USE_TRITON env var (set in .env or shell).
+#   Defaults to True — the Triton FlashAttention kernel is the production path.
+#   Set USE_TRITON=false to force PyTorch's fused SDPA (useful for parity checks).
+USE_TRITON = os.environ.get("USE_TRITON", "true").lower() in ("1", "true", "yes", "on")
 
 
 class GroupedQueryAttention(nn.Module):
@@ -137,22 +145,30 @@ class GroupedQueryAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, start_pos, k, v)
 
-        # --- 6. Repeat KV heads to match Q head count (GQA) ---
-        # Each KV head is reused by num_kv_groups Q heads
-        # (B, n_heads_kv, T, head_dim) → (B, n_heads_q, T, head_dim)
-        if self.num_kv_groups > 1:
-            k = k.repeat_interleave(self.num_kv_groups, dim=1)
-            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        # --- 6. Attention ---
+        # Triton FlashAttention handles GQA internally (maps each Q head to its
+        # KV head), so we pass the un-repeated K/V. The PyTorch SDPA path needs
+        # K/V repeated up to the Q head count first.
+        #
+        # Causal masking: prefill (T>1, Tq==Tk) is lower-triangular; decode
+        # (T==1) attends to the whole cached prefix. The flash kernel derives
+        # the per-row mask from a Tk-Tq offset, so we hand it the same is_causal
+        # flag SDPA uses.
+        causal = (T > 1)
 
-        # --- 7. Scaled dot-product attention ---
-        # PyTorch's fused SDPA handles: scale, causal mask, softmax, dropout
-        # is_causal=True builds the causal mask automatically
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=(T > 1),  # causal only during prefill; decode is always "attending to past"
-        )
+        if USE_TRITON and q.is_cuda:
+            from kernels.attention_kernel import attention_flash_triton
+            out = attention_flash_triton(q, k, v, causal=causal)
+        else:
+            if self.num_kv_groups > 1:
+                k = k.repeat_interleave(self.num_kv_groups, dim=1)
+                v = v.repeat_interleave(self.num_kv_groups, dim=1)
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=causal,
+            )
         # out: (B, n_heads_q, T, head_dim)
 
         # --- 8. Merge heads and project output ---
