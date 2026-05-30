@@ -1,3 +1,8 @@
 __pycache__/
 .venv/
 .env
+
+# Profiling artifacts (traces, reports, plots) — regenerate locally
+profiling/out/
+# Per-run generation metrics
+metrics/
