@@ -75,7 +75,7 @@ Replace ops one at a time with Triton kernels. Re-run the same benchmarks after 
 
 ---
 
-## Section 4 — RMSNorm  ← next
+## Section 4 — RMSNorm
 
 **Class:** `RMSNorm` in `ops/rmsnorm.py`
 
@@ -327,6 +327,15 @@ def generate(prompt, model, tokenizer, kv_cache, max_new_tokens,
 
 ## Section 13.5 — Profiling  (torch.profiler → nsys → ncu)
 
+> **Setup ready (`profiling/`).** Scripts wired for the attention-kernel deep dive:
+> `profile_attention_torch.py` (Step 1 key_averages), `profile_attention_trace.py`
+> (Step 2/3 schedule + chrome trace + memory), `roofline_attention.py`
+> (compute- vs memory-bound table/plot), `profile_attention_nsys.py` + `run_nsys.sh`
+> / `run_ncu.sh` (Step 4 NVTX + cudaProfilerApi). Shared helpers in
+> `profile_utils.py`. torch-only scripts verified working; nsys/ncu/matplotlib
+> are optional installs (see `profiling/README.md`).
+
+
 The benchmarks in Section 13 tell you *how fast*. Profiling tells you *where time goes and why* — the input to every kernel decision in Section 14.
 
 **Rule:** always warm up before profiling. The first few iterations carry cuDNN/cuBLAS plan selection and Triton JIT compilation — one-time costs that inflate every op's apparent latency by 10–100×. Discard at least 5 steps before capturing.
@@ -448,14 +457,28 @@ ncu --set full -o kernel_report python script.py
     traffic so the saving was real but the 2D indexing/masking overhead
     in Triton dominated. Reverted.
 
-### 14d — Attention kernel  `kernels/attention_kernel.py`
-- Write a naive (non-flash) Triton attention kernel:
-  - Compute full QK^T, apply mask, softmax row-wise, multiply V
-  - This materializes the full T×T matrix — pedagogically important, shows the memory wall
-- Then switch to `flash_attn` or `torch.sdpa` and show why tiling matters
-- Expected win: large at long sequences — naive attention is O(T²) memory, flash is O(T)
+### 14d — Attention kernel  `kernels/attention_kernel.py`  ✅ DONE
+A FlashAttention-2 forward kernel, written to teach the **memory wall** and how
+FlashAttention clears it. (A naive materialise-the-T×T-scores version was
+prototyped to demonstrate the wall, then dropped — only flash ships.)
+- **Flash** (`attention_flash_triton`): online-softmax running state
+  `(m_i, l_i, acc)` lives in registers while K/V stream in `BLOCK_N` tiles, so
+  the T×T score matrix never touches HBM (O(T·d) traffic vs O(T²)). Autotuned
+  over `BLOCK_M∈{64,128}`, `BLOCK_N∈{32,64}`, warps∈{4,8}, stages∈{2,3}.
+- **GQA handled inside the kernel:** query head `h` reads KV head `h//KV_GROUP`,
+  so no `repeat_interleave` copy of K/V (that copy is what the PyTorch path pays).
+- **Causal masking via a `Tk−Tq` query offset:** one code path covers prefill
+  (offset 0, lower-triangular), decode (Tq=1 attends the whole cached prefix),
+  and chunked-prefill (Tq<Tk). Matches `F.scaled_dot_product_attention(is_causal)`.
+- Wired into `ops/attention.py` behind `USE_TRITON`; PyTorch SDPA is the fallback.
+- **Results on RTX 6000 Ada bf16 (prefill, causal, Llama 24Q/8KV/d=128):**
+  flash beats torch SDPA at every size (e.g. T=4096: **683µs vs 779µs**,
+  T=128: 10.8µs vs 19.2µs). Correctness vs SDPA ≤3.9e-3, decode ≤1e-3.
+- **The memory wall, measured:** a materialised fp32 score matrix would move
+  1.5× (T=128) → **48× (T=4096, 3.2 GB vs 67 MB)** more HBM than flash's total I/O.
+- Bench: `benchmarks/benchmark_kernel/bench_attention_compare.py`.
 
-### 14e — Final benchmark comparison
+### 14e — Final benchmark comparison  ← next
 Re-run `benchmarks/run_baseline.py` with all kernels active.  
 Print side-by-side: baseline vs Triton, delta per op, overall tokens/sec improvement.  
 Plot the roofline: is each op compute-bound or memory-bound on RTX 6000 Ada (960 GB/s bandwidth, 1457 TFLOPS BF16)?
