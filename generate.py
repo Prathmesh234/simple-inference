@@ -44,6 +44,7 @@ from model.llama import LlamaModel
 from model.kv_cache import KVCache
 from tokenizer import Tokenizer
 from sampling import sample
+from utilities import write_run_metrics, print_metrics_table
 
 
 def generate(
@@ -127,17 +128,24 @@ def generate_with_stats(
     temperature: float = 1.0,
     top_k: int = 50,
     top_p: float = 0.9,
+    on_token=None,
 ) -> tuple[str, dict]:
     """
     Non-streaming version that returns the full generated text and timing stats.
 
     Returns:
         (generated_text, stats)  where stats = {
-            "prompt_tokens":  int,
-            "new_tokens":     int,
-            "prefill_ms":     float,
-            "decode_ms_avg":  float,
-            "decode_tok_s":   float,
+            "prompt_tokens":  int,    # prompt length fed to prefill
+            "new_tokens":     int,    # tokens actually generated
+            "ttft_ms":        float,  # Time To First Token: request start →
+                                      #   first generated token (prefill + 1 sample)
+            "tpot_ms":        float,  # Time Per Output Token: avg inter-token
+                                      #   latency over decode steps (excludes TTFT)
+            "prefill_ms":     float,  # prefill forward pass only
+            "decode_tok_s":   float,  # steady-state decode throughput = 1000/tpot
+            "total_wall_ms":  float,  # whole call wall time
+            "total_tok_s":    float,  # (prompt+new) / total_wall
+            "peak_vram_gb":   float,
         }
     """
     device = next(model.parameters()).device
@@ -151,6 +159,10 @@ def generate_with_stats(
 
     kv_cache.reset()
     tokens_out = []
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+    wall_start = time.perf_counter()
 
     # Prefill
     torch.cuda.synchronize()
@@ -164,41 +176,64 @@ def generate_with_stats(
         logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
     ).item()
 
+    # TTFT: request start → first token ready (prefill + first sample).
+    torch.cuda.synchronize()
+    ttft_ms = (time.perf_counter() - wall_start) * 1000
+
     decode_times = []
     pos = T
 
     if next_tok_id != tokenizer.eos_id:
         tokens_out.append(next_tok_id)
+        if on_token is not None:
+            on_token(tokenizer.decode([next_tok_id], skip_special=True))
 
-        with torch.no_grad():
-            for _ in range(max_new_tokens - 1):
-                if pos >= kv_cache.max_seq_len:
-                    break
-                tok_tensor = torch.tensor([[next_tok_id]], dtype=torch.long, device=device)
-                torch.cuda.synchronize()
-                ts = time.perf_counter()
-                logits = model(tok_tensor, start_pos=pos, kv_cache=kv_cache)
-                torch.cuda.synchronize()
-                decode_times.append((time.perf_counter() - ts) * 1000)
+        try:
+            with torch.no_grad():
+                for _ in range(max_new_tokens - 1):
+                    if pos >= kv_cache.max_seq_len:
+                        break
+                    tok_tensor = torch.tensor([[next_tok_id]], dtype=torch.long, device=device)
+                    torch.cuda.synchronize()
+                    ts = time.perf_counter()
+                    logits = model(tok_tensor, start_pos=pos, kv_cache=kv_cache)
+                    torch.cuda.synchronize()
+                    decode_times.append((time.perf_counter() - ts) * 1000)
 
-                next_tok_id = sample(
-                    logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
-                ).item()
-                pos += 1
+                    next_tok_id = sample(
+                        logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
+                    ).item()
+                    pos += 1
 
-                if next_tok_id == tokenizer.eos_id:
-                    break
-                tokens_out.append(next_tok_id)
+                    if next_tok_id == tokenizer.eos_id:
+                        break
+                    tokens_out.append(next_tok_id)
+                    if on_token is not None:
+                        on_token(tokenizer.decode([next_tok_id], skip_special=True))
+        except KeyboardInterrupt:
+            # Stop cleanly so partial timing stats are still returned/logged.
+            pass
 
-    avg_decode_ms = sum(decode_times) / len(decode_times) if decode_times else 0.0
+    total_wall_ms = (time.perf_counter() - wall_start) * 1000
+    # TPOT (Time Per Output Token) = average inter-token latency across decode
+    # steps, i.e. every token AFTER the first. This is the steady-state cost.
+    tpot_ms = sum(decode_times) / len(decode_times) if decode_times else 0.0
     generated_text = tokenizer.decode(tokens_out, skip_special=True)
+    peak_vram_gb = (
+        torch.cuda.max_memory_allocated(device) / 1e9 if torch.cuda.is_available() else 0.0
+    )
+    total_new = len(tokens_out)
 
     stats = {
         "prompt_tokens": T,
-        "new_tokens":    len(tokens_out),
+        "new_tokens":    total_new,
+        "ttft_ms":       round(ttft_ms, 2),
+        "tpot_ms":       round(tpot_ms, 3),
         "prefill_ms":    round(prefill_ms, 2),
-        "decode_ms_avg": round(avg_decode_ms, 3),
-        "decode_tok_s":  round(1000.0 / avg_decode_ms, 1) if avg_decode_ms > 0 else 0.0,
+        "decode_tok_s":  round(1000.0 / tpot_ms, 1) if tpot_ms > 0 else 0.0,
+        "total_wall_ms": round(total_wall_ms, 2),
+        "total_tok_s":   round((T + total_new) / (total_wall_ms * 1e-3), 1) if total_wall_ms > 0 else 0.0,
+        "peak_vram_gb":  round(peak_vram_gb, 2),
     }
     return generated_text, stats
 
@@ -253,12 +288,25 @@ if __name__ == "__main__":
 
     print(f"\nPrompt: {PROMPT!r}\n")
     print("Output: ", end="", flush=True)
-    for token_str in generate(PROMPT, model, tok, kv, max_new_tokens=2048,
-                               temperature=0.7, top_k=50, top_p=0.9):
-        print(token_str, end="", flush=True)
 
-    print("\n\n--- Stats ---")
-    _, stats = generate_with_stats(PROMPT, model, tok, kv, max_new_tokens=2048,
-                                    temperature=0.7, top_k=50, top_p=0.9)
-    for k, v in stats.items():
-        print(f"  {k:<18}: {v}")
+    SAMPLING = {"temperature": 0.7, "top_k": 50, "top_p": 0.9}
+
+    # Single measured run: stream tokens live AND collect TTFT/TPOT in one pass.
+    # generate_with_stats swallows KeyboardInterrupt internally and returns the
+    # partial stats, so the metrics file is written even if you Ctrl-C early.
+    generated_text, stats = generate_with_stats(
+        PROMPT, model, tok, kv, max_new_tokens=2048,
+        on_token=lambda s: print(s, end="", flush=True),
+        **SAMPLING,
+    )
+
+    # Which attention/RMSNorm/etc. path actually ran this generation.
+    import ops.attention as attn_mod
+    backend = "triton (fused kernels)" if attn_mod.USE_TRITON else "pytorch (SDPA reference)"
+
+    print_metrics_table(stats, backend)
+    run_path = write_run_metrics(
+        PROMPT, generated_text, stats,
+        backend=backend, model_id=MODEL_ID, sampling=SAMPLING,
+    )
+    print(f"\n  Metrics saved to {run_path}")
