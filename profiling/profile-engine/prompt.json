@@ -1,0 +1,21 @@
+{
+  "_comment": "Dummy prompts for profiling the full inference engine across prompt-length regimes. Each flavor stresses a different prefill cost (sequence length) while decode stays roughly constant per token. Tune max_new_tokens per flavor so the profiled run captures both prefill and a representative decode tail.",
+  "prompts": {
+    "short": {
+      "max_new_tokens": 32,
+      "text": "What is the capital of France?"
+    },
+    "medium_short": {
+      "max_new_tokens": 64,
+      "text": "Explain, in a few sentences, how a transformer language model turns a sequence of input tokens into a probability distribution over the next token. Mention attention and the feed-forward layers."
+    },
+    "medium_long": {
+      "max_new_tokens": 128,
+      "text": "You are a senior systems engineer. A teammate asks you to compare three caching strategies for a high-throughput web service: a write-through cache, a write-back cache, and a write-around cache. For each strategy, describe how reads and writes flow through the cache and the backing store, the consistency guarantees it provides, the failure modes to watch out for, and the kind of workload it is best suited to. Then recommend a default choice for a read-heavy social feed and justify the trade-offs you are making."
+    },
+    "long": {
+      "max_new_tokens": 256,
+      "text": "Question: Design a real-time chat application that can scale to millions of concurrent users.\nAnswer: To design a real-time chat application at scale, we use a microservices architecture with WebSockets for persistent connections, a message broker like Redis Pub/Sub for routing messages, and a NoSQL database like Cassandra for storing message history. The key components are:\n1. Connection Gateway: Handles WebSocket handshakes and maintains active connection states.\n2. Message Broker: Distributes incoming messages to the correct gateway servers.\n3. Database Cluster: Writes chat history asynchronously to avoid blocking the hot path.\n\nQuestion: Design a distributed, fault-tolerant key-value store that supports strong consistency and automatic partitioning.\nAnswer: A consistent key-value store can be designed using the Raft consensus protocol for replication and consistent hashing for partitioning. The system consists of:\n1. Consensus Group (Raft): Ensures all write operations are committed in a linearizable log across a quorum of nodes.\n2. Partition Router: Maps keys to specific node rings using consistent hashing to minimize data movement during scaling.\n3. Storage Engine: Uses Log-Structured Merge (LSM) trees (like RocksDB) for high-performance write throughput.\n\nQuestion: Design a system that can download, parse, and index billions of web pages daily for a search engine. Explain the crawling pipeline, duplicate detection, and scaling strategies.\nAnswer:"
+    }
+  }
+}
