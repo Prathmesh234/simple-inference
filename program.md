@@ -21,6 +21,14 @@ you also invent: borrow abstractions from operating systems, databases,
 networking, compilers, and hardware architecture, name the analogy
 explicitly, and verify with measurement.
 
+**Use the web.** You have web search and fetch tools — use them. Inference
+is a fast-moving research area; read the papers (arXiv, MLSys, OSDI,
+ASPLOS, ISCA) and the implementations (vLLM, SGLang, TensorRT-LLM, TGI)
+before committing to a big rewrite. Take inspiration from research, not
+dictation — strip ideas down to their mechanism and ask whether the
+mechanism fits *your* bottleneck on Llama-3.1-8B. See the "Use the web —
+read the papers" subsection below for details.
+
 ## Target model
 
 **`meta-llama/Llama-3.1-8B`** (text-only Llama 3.1 base). HuggingFace
@@ -205,6 +213,51 @@ thought*: pattern-match across domains, then verify with first
 principles. Your commit message should read like a hypothesis ("treat
 the KV cache like a page cache") followed by a measurement ("decode_tok_s
 118.7 → 131.4"). That is the unit of progress.
+
+### Use the web — read the papers
+
+You have web search and web fetch tools. **Use them.** Inference is a
+hot, public research area; new techniques land monthly on arXiv and in
+the vLLM / SGLang / TensorRT-LLM / TGI changelogs. Before you swing on a
+big idea, do a focused literature pass:
+
+- Search arXiv, conference proceedings (MLSys, OSDI, SOSP, ASPLOS, ISCA,
+  NeurIPS systems track), and recent engineering blogs.
+- Read the actual paper, not just the abstract. Find the figure that
+  shows *what they measured and on what hardware*. That tells you whether
+  the win will transport to your setup.
+- Read the open-source implementation if one exists. The paper is the
+  idea; the code is the contract. The delta between them is usually
+  where the real engineering lives.
+- Skim the references the paper cites and the papers that cite it. The
+  citation graph is your shortcut to the frontier.
+
+Treat papers as **inspiration, not gospel**. A paper claiming a 3× win
+on a different model at a different sequence length on different
+hardware will not give you 3× — but the *mechanism* it exploits may
+still apply. Strip the idea down to its mechanism, ask whether the
+mechanism fits your bottleneck, then implement the smallest version of
+it that you can measure. If the mechanism is novel to you, name it in
+the commit message ("inspired by FlashDecoding split-KV reduction —
+arxiv:2311.01282") so the lineage is preserved.
+
+Web searches are also fair game when you're stuck on a specific
+engineering detail: a Triton autotune pattern, a CUDA stream
+synchronization quirk, an obscure PyTorch API. Look it up rather than
+guessing. The goal is throughput, not heroic recall.
+
+When to search:
+- Before committing to a multi-hour rewrite — confirm the mechanism is
+  sound and that nobody has already shown it doesn't work on Llama-3.1-8B.
+- When you have profiled and named a bottleneck (e.g. "decode is bound
+  by KV-cache DRAM reads") — search the literature for that bottleneck
+  specifically.
+- When two of your last three experiments have flopped — your mental
+  model has stale priors. Refresh it from the literature.
+
+Do NOT search instead of thinking. The web is for borrowing mechanisms,
+not for outsourcing the decision of what to try next. That decision is
+always yours, made from a profile of *this* engine.
 
 ## Output format
 
