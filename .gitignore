@@ -4,5 +4,10 @@ __pycache__/
 
 # Profiling artifacts (traces, reports, plots) — regenerate locally
 profiling/out/
+# Chrome/Perfetto timeline traces (large, machine-generated)
+profiling/**/*_trace.json
+# Nsight binary reports
+profiling/**/*.nsys-rep
+profiling/**/*.ncu-rep
 # Per-run generation metrics
 metrics/
