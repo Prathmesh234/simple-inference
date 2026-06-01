@@ -3,69 +3,53 @@
 This is an experiment to have an LLM autonomously optimize an inference engine.
 
 The starting point is `iterations/03_engine.py` — a working pure-PyTorch
-engine for `meta-llama/Llama-3.2-11B-Vision` with a prefill + decode loop,
-KV cache, and temperature/top-k/top-p sampling. **That file is the base
+engine for `meta-llama/Llama-3.1-8B` with a prefill + decode loop, KV
+cache, and temperature/top-k/top-p sampling. **That file is the base
 engine you start from. Always optimize. Never stand still — every loop
 iteration must attempt a new optimization, measure it, and either keep or
 revert.**
 
-You decide which optimizations to try — KV-cache layout, fused Triton
-kernels, quantization, CUDA graphs, speculative decoding, paged attention,
-weight repacking, batching tricks, whatever you can justify from profile
-data. No optimization is pre-prescribed. Build the engine up from
-`iterations/03_engine.py` and make it as fast as it will go.
+You decide which optimizations to try. No optimization is pre-prescribed.
+Build the engine up from `iterations/03_engine.py` and make it as fast as
+it will go.
+
+Be creative. The well-known tricks (fused kernels, quantization, CUDA
+graphs, speculative decoding, paged attention, radix prefix sharing) are
+fair game — but they are only the floor. Read the "How to think about
+this" section below before you start swinging. The expectation is that
+you also invent: borrow abstractions from operating systems, databases,
+networking, compilers, and hardware architecture, name the analogy
+explicitly, and verify with measurement.
 
 ## Target model
 
-**`meta-llama/Llama-3.2-11B-Vision`** (multimodal Llama 3.2). For
-token-throughput optimization, only the text decoder matters; the vision
-encoder is exercised only when an image is in the prompt. HuggingFace
+**`meta-llama/Llama-3.1-8B`** (text-only Llama 3.1 base). HuggingFace
 spec:
 
-### Text decoder (`MllamaTextConfig`)
-
-| Property                | Value                                     |
-|-------------------------|-------------------------------------------|
-| `hidden_size`           | 4096                                      |
-| `intermediate_size`     | 14336                                     |
-| `num_hidden_layers`     | 40                                        |
-| `num_attention_heads`   | 32                                        |
-| `num_key_value_heads`   | 8  (GQA, 4:1 ratio)                       |
-| `head_dim`              | 128                                       |
-| `vocab_size`            | 128256                                    |
-| `max_position_embeddings` | 131072                                  |
-| `rope_theta`            | 500000.0                                  |
-| `rms_norm_eps`          | 1e-5                                      |
-| `hidden_act`            | silu (SwiGLU MLP)                         |
-| `tie_word_embeddings`   | False                                     |
-| `cross_attention_layers`| [3, 8, 13, 18, 23, 28, 33, 38]            |
-| Norm                    | RMSNorm                                   |
-| Position encoding       | RoPE                                      |
-
-The 8 cross-attention layers attend to vision tokens when present. For
-text-only prompts they pass through residually — they still cost
-parameters and a forward pass, so don't skip them in the engine.
-
-### Vision encoder (`MllamaVisionConfig`)
-
-| Property                | Value          |
-|-------------------------|----------------|
-| `hidden_size`           | 1280           |
-| `num_hidden_layers`     | 32             |
-| `num_global_layers`     | 8              |
-| `intermediate_size`     | 5120           |
-| `num_attention_heads`   | 16             |
-| `num_channels`          | 3              |
-| `patch_size`            | 14             |
-| `image_size`            | 560            |
-| `vision_output_dim`     | 7680           |
-| `max_num_tiles`         | 4              |
+| Property                  | Value                                              |
+|---------------------------|----------------------------------------------------|
+| `hidden_size`             | 4096                                               |
+| `intermediate_size`       | 14336                                              |
+| `num_hidden_layers`       | 32                                                 |
+| `num_attention_heads`     | 32                                                 |
+| `num_key_value_heads`     | 8 (GQA, 4:1 ratio)                                 |
+| `head_dim`                | 128                                                |
+| `vocab_size`              | 128256                                             |
+| `max_position_embeddings` | 131072                                             |
+| `rope_theta`              | 500000.0                                           |
+| `rope_scaling`            | `{type: llama3, factor: 8.0, low_freq_factor: 1.0, high_freq_factor: 4.0, original_max_position_embeddings: 8192}` |
+| `rms_norm_eps`            | 1e-5                                               |
+| `hidden_act`              | silu (SwiGLU MLP)                                  |
+| `tie_word_embeddings`     | False                                              |
+| Norm                      | RMSNorm                                            |
+| Position encoding         | RoPE (Llama 3.1 scaled rope)                       |
 
 ### Totals
 
-- ~10.7 B parameters (≈ 8 B text decoder + ≈ 2.7 B vision/cross-attn + adapters)
-- bfloat16 weights ≈ 21 GB on disk
-- KV cache (text decoder, 1 sample, 8192 ctx) ≈ 5.4 GB in bf16
+- 8.03 B parameters
+- bfloat16 weights ≈ 16 GB on disk
+- KV cache (1 sample, 8192 ctx) ≈ 4.3 GB in bf16
+  (`2 × 32 layers × 8 kv-heads × 128 head_dim × 8192 tokens × 2 bytes`)
 
 ## Setup
 
@@ -75,7 +59,7 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b inference/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these for full context:
    - `iterations/03_engine.py` — **the base engine you start from.** Pure PyTorch prefill + decode + KV cache + sampling. Every optimization is a delta against this.
-   - `config.py` — `ModelConfig`. Initialize it for `Llama-3.2-11B-Vision` using the spec above, then frozen.
+   - `config.py` — `ModelConfig`. Initialize it for `Llama-3.1-8B` using the spec above, then frozen.
    - `loader.py` — pulls weights from HuggingFace. Frozen.
    - `tokenizer.py` — wraps the HF fast tokenizer. Frozen.
    - `env_loader.py` — loads `HF_TOKEN`. Frozen.
@@ -87,13 +71,13 @@ To set up a new experiment, work with the user to:
    - `kernels/` — existing Triton kernels (attention, rmsnorm, rope, swiglu). **Editable** (replace, add, or remove).
    - `benchmarks/run_baseline.py`, `benchmarks/bench_utils.py` — the measurement harness. **Frozen.** This is your ground truth.
    - `profiling/` — torch / nsys / tensorboard profilers + roofline. Use these to find hotspots.
-4. **Verify the model loads**: `HF_TOKEN` must be set (see `.env.example`). A first generate run should succeed end-to-end. Llama-3.2-11B-Vision is gated — make sure you have access.
+4. **Verify the model loads**: `HF_TOKEN` must be set (see `.env.example`). A first generate run should succeed end-to-end. Llama-3.1-8B is gated — make sure you have access.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline gets recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good, then kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU against `meta-llama/Llama-3.2-11B-Vision`
+Each experiment runs on a single GPU against `meta-llama/Llama-3.1-8B`
 in bfloat16. You launch a measurement with:
 
 ```
@@ -113,16 +97,16 @@ formatted summary. That is the ground-truth measurement.
   metric without breaking correctness.
 
 **What you CANNOT do:**
-- Modify `config.py` (after initial 11B setup), `loader.py`, `tokenizer.py`,
+- Modify `config.py` (after initial 8B setup), `loader.py`, `tokenizer.py`,
   or `env_loader.py`. The model identity is fixed.
 - Modify `benchmarks/run_baseline.py` or `benchmarks/bench_utils.py`. The
   harness is the ground-truth metric.
 - Install new packages or add dependencies. You only get what's already in
   `pyproject.toml`.
-- Change the target model. It is always Llama-3.2-11B-Vision.
+- Change the target model. It is always Llama-3.1-8B.
 
-**The goal: maximize decode throughput (`decode_tok_s`) on
-Llama-3.2-11B-Vision** under the standard prompt in `generate.py`'s
+**The goal: maximize decode throughput (`decode_tok_s`) on Llama-3.1-8B**
+under the standard prompt in `generate.py`'s
 `__main__`. Prefill latency (`ttft_ms`) is the secondary metric — don't
 regress it badly chasing decode wins. Correctness is a hard gate: greedy
 decode (`temperature=0`) of the standard prompt must match the baseline's
@@ -141,6 +125,87 @@ best wins.
 `benchmarks/run_baseline.py` as-is against the unmodified base engine
 from `iterations/03_engine.py`. Record those numbers as the row to beat.
 
+## How to think about this
+
+The best ideas in systems engineering come from looking sideways —
+borrowing a solved abstraction from one domain and recognizing it fits an
+unsolved problem in another.
+
+**PagedAttention** did not invent anything new. It looked at the KV cache
+— a fragmented, wasteful memory problem — and recognized that operating
+systems had already solved exactly this class of problem decades ago with
+virtual memory and paging. The insight was not technical. It was
+perceptual.
+
+**RadixAttention** looked at the same space and saw prefix sharing — the
+observation that many requests share common prefixes, and that a radix
+tree already knows how to handle shared prefixes efficiently.
+
+The pattern: *a hard inference problem is often a disguised instance of a
+solved systems problem.*
+
+Look at the components of inference — attention computation, memory
+layout, scheduling, batching, eviction, communication — and ask: where
+have humans solved something structurally identical before? The answers
+are not always in ML research. They are in operating systems, databases,
+networking, compilers, and hardware architecture. The discipline that
+built the internet, the filesystem, and the CPU cache has been solving
+your problems for fifty years.
+
+Then go further. Once you have the borrowed analogies in hand, generate
+your own. Stare at the dataflow of a decode step and notice what is
+*wasted* — compute thrown away, bytes moved through memory twice, a tile
+loaded that the next tile needs again, a stall waiting on a tensor that
+was already in registers. Each waste is a hint at a structure waiting to
+be named.
+
+### Working principles
+
+1. **Start from first principles.** Understand *why* a current approach
+   is bottlenecked before proposing a fix. "It's slow" is not a diagnosis.
+   "We are memory-bandwidth-bound at 870 GB/s of 1008 GB/s peak because
+   the KV cache reload dominates the decode step" is a diagnosis.
+2. **Name the analogy explicitly.** When you borrow from another domain,
+   say so in the commit message and in `results.tsv`. "KV cache as
+   page-cache with LRU eviction" is honest. "Tried a new caching idea" is
+   not. Naming keeps reasoning transferable, lets you reuse the same
+   abstraction next loop, and makes regressions easier to diagnose.
+3. **Prefer structural solutions over numerical ones.** A better
+   algorithm beats a faster kernel. A better abstraction beats a better
+   algorithm. Shaving 2% off an op is local; restructuring the dataflow
+   so the op runs half as often is global.
+4. **Hunt the wasted work.** Compute that is discarded, memory that sits
+   idle, transfers that move the same bytes twice, tiles that get loaded
+   then evicted then reloaded — these are your targets. Every modern
+   inference win is, at heart, the removal of waste.
+5. **Iterate.** No design survives first contact with constraints. Write,
+   measure, critique, revise. The loop is the methodology.
+
+### Sources to mine for analogies (non-exhaustive)
+
+- **Operating systems**: paging, virtual memory, copy-on-write, page
+  cache, working sets, LRU/CLOCK eviction, slab allocation,
+  scheduling (CFS, EDF), context switching.
+- **Databases**: buffer pools, B-tree / LSM tree layouts, query plans,
+  vectorized execution, materialized views, write-ahead logs, index
+  prefix sharing.
+- **Networking**: pipelining, head-of-line blocking, batching vs latency
+  tradeoffs, congestion control, multiplexing, RDMA-style zero-copy.
+- **Compilers**: register allocation, loop fusion / tiling / unrolling,
+  SSA, dead-code elimination, profile-guided optimization, polyhedral
+  scheduling.
+- **Hardware architecture**: cache hierarchies, prefetching, branch
+  prediction, speculative execution, out-of-order issue, NUMA, banked
+  memory, scratchpads.
+- **Distributed systems**: sharding, replication, consensus, work
+  stealing, gossip, content-addressable storage.
+
+These are starting points, not a checklist. The point is the *mode of
+thought*: pattern-match across domains, then verify with first
+principles. Your commit message should read like a hypothesis ("treat
+the KV cache like a page cache") followed by a measurement ("decode_tok_s
+118.7 → 131.4"). That is the unit of progress.
+
 ## Output format
 
 `run_baseline.py` prints a summary like:
@@ -150,8 +215,8 @@ from `iterations/03_engine.py`. Record those numbers as the row to beat.
 prefill_tok_s_T512:   12480.3
 decode_tok_s_B1:      118.7
 decode_tok_s_B8:      642.1
-peak_vram_gb:         24.1
-ttft_ms_T512:         62.0
+peak_vram_gb:         17.2
+ttft_ms_T512:         54.0
 backend:              triton
 ```
 
@@ -203,9 +268,9 @@ Example:
 
 ```
 commit	decode_tok_s	ttft_ms	vram_gb	status	description
-a1b2c3d	118.7	62.0	24.1	keep	baseline (03_engine.py, pytorch + existing triton kernels)
-b2c3d4e	131.4	61.8	24.2	keep	fuse rmsnorm into attention qkv proj
-c3d4e5f	119.1	60.2	24.1	discard	swap sampler to torch.multinomial (no decode win)
+a1b2c3d	118.7	54.0	17.2	keep	baseline (03_engine.py, pytorch + existing triton kernels)
+b2c3d4e	131.4	53.8	17.3	keep	fuse rmsnorm into attention qkv proj
+c3d4e5f	119.1	52.2	17.2	discard	swap sampler to torch.multinomial (no decode win)
 d4e5f6g	0.0	0.0	0.0	crash	int8 weight-only quant — accuracy gate failed
 ```
 
