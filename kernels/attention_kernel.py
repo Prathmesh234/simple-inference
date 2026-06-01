@@ -238,6 +238,7 @@ def attention_flash_triton(
     v: torch.Tensor,
     causal: bool,
     sm_scale: float | None = None,
+    assume_contiguous: bool = False,
 ) -> torch.Tensor:
     """
     FlashAttention-2 forward in Triton. Drop-in for
@@ -249,6 +250,12 @@ def attention_flash_triton(
         v: (B, Hkv, Tk, D)
         causal:   apply the causal mask (with a Tk-Tq query offset)
         sm_scale: 1/sqrt(D) if None
+        assume_contiguous: skip the per-call `.contiguous()` on q/k/v. The
+            kernel indexes with explicit strides, so it only needs the tensors
+            to be contiguous so Triton's pointer arithmetic is valid. Hot paths
+            that already guarantee contiguous inputs (e.g. the decode KV-cache
+            path) can pass True to drop the per-call CPU check/copy. Leave False
+            (default) when inputs may be views/transposed — correctness first.
     Returns:
         (B, Hq, Tq, D), same dtype as q
     """
@@ -260,7 +267,8 @@ def attention_flash_triton(
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
 
-    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    if not assume_contiguous:
+        q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
     out = torch.empty_like(q)
 
     grid = lambda meta: (triton.cdiv(Tq, meta["BLOCK_M"]), B * Hq)
