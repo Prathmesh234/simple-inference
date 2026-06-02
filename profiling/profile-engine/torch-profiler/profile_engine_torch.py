@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -55,7 +56,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import env_loader  # noqa: F401,E402  reads .env so USE_TRITON / HF_TOKEN are set before imports
 import torch  # noqa: E402
-from torch.profiler import profile, ProfilerActivity  # noqa: E402
+from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 from config import ModelConfig  # noqa: E402
@@ -79,6 +80,10 @@ TOP_P       = 0.9
 PROMPT_FILE = THIS_DIR.parent / "prompt.json"
 OUT_DIR = THIS_DIR / "out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# TensorBoard logdir lives in the sibling reserved folder. The torch_tb_profiler
+# plugin reads the *.pt.trace.json files written here via tensorboard_trace_handler.
+TB_DIR = THIS_DIR.parent / "tensorboard-profiler" / "logdir"
 
 ACTIVITIES = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 FLAVOR_ORDER = ["short", "medium_short", "medium_long", "long"]
@@ -151,7 +156,25 @@ def tokenize_one(text: str, tokenizer) -> torch.Tensor:
     return enc["input_ids"].to(DEVICE)
 
 
-def build_engine(prompts: dict, tokenizer) -> tuple[LlamaModel, KVCache, dict, int]:
+def tokenize_batch(texts: list[str], tokenizer) -> torch.Tensor:
+    """Tokenize DISTINCT prompts into one (B, T) batch.
+
+    Decoder-only batched generation uses LEFT padding so real content ends at the
+    last column: logits[:, -1, :] is then the true final token for every row and
+    all rows decode in lockstep at a shared start_pos. (The engine carries a single
+    global position offset and no padding mask, so left padding is the only layout
+    that keeps the sampled-from column valid across rows.)
+    """
+    prev_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        enc = tokenizer(texts, return_tensors="pt", padding=True)
+    finally:
+        tokenizer.padding_side = prev_side
+    return enc["input_ids"].to(DEVICE)
+
+
+def build_model() -> tuple[LlamaModel, ModelConfig]:
     # Identical model construction to 03_engine.py __main__.
     cfg    = ModelConfig.llama_3_2_3b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
@@ -160,50 +183,76 @@ def build_engine(prompts: dict, tokenizer) -> tuple[LlamaModel, KVCache, dict, i
     model.load_weights(loader)
     model.to(DEVICE, DTYPE)
     model.eval()
+    return model, cfg
 
-    # Tokenize every flavor once so we can size the KV cache for the worst case
-    # (longest prompt + its decode budget), exactly like 03 sizes from workloads.
-    tokenized = {}
-    max_prompt_seen   = 0
-    max_decode_per_wl = 0
-    for name, spec in prompts.items():
-        ids   = tokenize_one(spec["text"], tokenizer)
+
+def build_runs(prompts: dict, flavors: list[str], batch_override, tokenizer) -> list[tuple]:
+    """Expand flavors into concrete (run_name, prompt_ids, n_new_tokens) runs.
+
+    A flavor carrying a 'B' list (with a 'texts' pool of distinct prompts) expands
+    into one run per batch size, each filling the batch with the first B DISTINCT
+    prompts (left-padded). Without B it stays a single batch-1 run from 'text'.
+    `batch_override` (CLI --batches) replaces the flavor's own B list when given.
+    """
+    runs = []
+    for name in flavors:
+        spec  = prompts[name]
         n_dec = int(spec.get("max_new_tokens", 64))
-        tokenized[name] = (ids, n_dec)
-        max_prompt_seen   = max(max_prompt_seen, ids.shape[1])
-        max_decode_per_wl = max(max_decode_per_wl, n_dec)
+        batches = batch_override if batch_override is not None else spec.get("B")
+        if batches:
+            texts = spec.get("texts") or [spec["text"]]
+            for B in batches:
+                if B > len(texts):
+                    raise SystemExit(
+                        f"flavor '{name}' batch {B} > {len(texts)} distinct prompts "
+                        f"in 'texts' — add more prompts or lower the batch size.")
+                ids = tokenize_batch(texts[:B], tokenizer)
+                runs.append((f"{name}_b{B}", ids, n_dec))
+        else:
+            ids = tokenize_one(spec["text"], tokenizer)
+            runs.append((name, ids, n_dec))
+    return runs
 
-    max_seq_len = max_prompt_seen + max_decode_per_wl
+
+def make_kv_cache(cfg: ModelConfig, runs: list[tuple]) -> tuple[KVCache, int]:
+    # Size the cache for the worst case across every planned run (widest batch and
+    # longest prompt+decode), exactly like 03 sizes from its workloads.
+    max_batch   = max(ids.shape[0] for _, ids, _ in runs)
+    max_seq_len = max(ids.shape[1] + n_dec for _, ids, n_dec in runs)
     kv_cache = KVCache(
         n_layers    = cfg.num_hidden_layers,
-        max_batch   = 1,
+        max_batch   = max_batch,
         max_seq_len = max_seq_len,
         n_heads_kv  = cfg.num_key_value_heads,
         head_dim    = cfg.head_dim,
         dtype       = DTYPE,
         device      = DEVICE,
     )
-    return model, kv_cache, tokenized, max_seq_len
+    return kv_cache, max_seq_len
 
 
 # ── profiling driver ─────────────────────────────────────────────────────────
 
-def _render_report(name: str, backend: str, prompt_tokens: int, n_new_tokens: int,
-                   prefill_ms: float, decode_ms: float, peak_vram_gb: float,
-                   table: str) -> str:
+def _render_report(name: str, backend: str, batch: int, prompt_tokens: int,
+                   n_new_tokens: int, prefill_ms: float, decode_ms: float,
+                   peak_vram_gb: float, table: str) -> str:
     """Assemble a clean, self-describing report: banner, summary block, op table.
     Same banner style as the kernel reports in profile-kernels/torch-profiler/out."""
     bar = "=" * 78
     rule = "-" * 78
+    # decode throughput across the whole batch — the number that climbs as more
+    # rows pack into one step and the GPU goes from idle to saturated.
+    decode_tps = (batch * 1000.0 / decode_ms) if decode_ms > 0 else 0.0
     return (
         f"{bar}\n"
         f"  ENGINE PROFILE (iteration-03 parity)  —  flavor='{name}'\n"
         f"{bar}\n"
         f"  backend       : {backend}\n"
-        f"  prompt tokens : {prompt_tokens}\n"
+        f"  batch size    : {batch}\n"
+        f"  prompt tokens : {prompt_tokens} (per row, left-padded)\n"
         f"  new tokens    : {n_new_tokens}\n"
         f"  prefill       : {prefill_ms:.2f} ms\n"
-        f"  decode/step   : {decode_ms:.3f} ms\n"
+        f"  decode/step   : {decode_ms:.3f} ms  ({decode_tps:.1f} tok/s over the batch)\n"
         f"  peak VRAM     : {peak_vram_gb:.2f} GB\n"
         f"  sampling      : temperature={TEMPERATURE}  top_k={TOP_K}  top_p={TOP_P}\n"
         f"{rule}\n"
@@ -214,7 +263,8 @@ def _render_report(name: str, backend: str, prompt_tokens: int, n_new_tokens: in
 
 
 def profile_flavor(name: str, prompt_ids: torch.Tensor, n_new_tokens: int,
-                   model: LlamaModel, kv_cache: KVCache, backend: str):
+                   model: LlamaModel, kv_cache: KVCache, backend: str,
+                   tensorboard: bool = True):
     # Warm up this prompt shape OUTSIDE the profiler (matches 03's WARMUP=2):
     # absorbs the one-time Triton JIT + autotune sweep so the captured run is
     # steady-state.
@@ -231,18 +281,33 @@ def profile_flavor(name: str, prompt_ids: torch.Tensor, n_new_tokens: int,
     peak_vram_gb = torch.cuda.max_memory_allocated(DEVICE) / 1e9
     table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=25)
 
-    report = _render_report(name, backend, prompt_ids.shape[1], n_new_tokens,
-                            prefill_ms, decode_ms, peak_vram_gb, table)
+    report = _render_report(name, backend, prompt_ids.shape[0], prompt_ids.shape[1],
+                            n_new_tokens, prefill_ms, decode_ms, peak_vram_gb, table)
 
     # One tidy .txt report + one Chrome/Perfetto trace per flavor, both in out/.
     report_path = OUT_DIR / f"profiler_engine_{name}.txt"
     report_path.write_text(report)
     trace_path = OUT_DIR / f"engine_{name}_trace.json"
-    prof.export_chrome_trace(str(trace_path))
+
+    # Kineto only lets the trace be serialized ONCE, so we export a single time and
+    # reuse the bytes for both sinks. When TensorBoard output is requested we route
+    # the one export through tensorboard_trace_handler (correct *.pt.trace.json name
+    # the torch_tb_profiler plugin expects) and then copy it to out/ as the Chrome
+    # trace; otherwise we export the Chrome trace directly.
+    if tensorboard:
+        tb_logdir = TB_DIR / name
+        tb_logdir.mkdir(parents=True, exist_ok=True)
+        tensorboard_trace_handler(str(tb_logdir))(prof)
+        tb_trace = max(tb_logdir.glob("*.pt.trace.json"), key=lambda p: p.stat().st_mtime)
+        shutil.copyfile(tb_trace, trace_path)
+    else:
+        prof.export_chrome_trace(str(trace_path))
 
     print(f"\n{report}")
     print(f"  report : {report_path}")
-    print(f"  trace  : {trace_path}  (open at chrome://tracing or ui.perfetto.dev)")
+    print(f"  trace  : {trace_path}  (Perfetto: serve_trace.py or drag into ui.perfetto.dev)")
+    if tensorboard:
+        print(f"  tboard : {tb_logdir}  (tensorboard --logdir {TB_DIR})")
 
 
 def main():
@@ -250,6 +315,11 @@ def main():
         description="torch.profiler over the iteration-03 inference engine")
     p.add_argument("--flavors", nargs="*", default=FLAVOR_ORDER,
                    help=f"prompt flavors to profile. choices: {', '.join(FLAVOR_ORDER)}")
+    p.add_argument("--batches", nargs="*", type=int, default=None,
+                   help="batch sizes to run (overrides the flavor's 'B' in prompt.json). "
+                        "Each batch is filled with that many DISTINCT prompts from 'texts'.")
+    p.add_argument("--no-tensorboard", dest="tensorboard", action="store_false",
+                   help="skip writing the TensorBoard logdir (on by default)")
     args = p.parse_args()
 
     assert torch.cuda.is_available(), "CUDA required to profile the inference engine"
@@ -267,14 +337,17 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
 
-    model, kv_cache, tokenized, max_seq_len = build_engine(prompts, tokenizer)
+    model, cfg = build_model()
+    runs = build_runs(prompts, args.flavors, args.batches, tokenizer)
+    kv_cache, max_seq_len = make_kv_cache(cfg, runs)
     print(f"  KV cache: {kv_cache}  (max_seq_len={max_seq_len})")
 
-    for name in args.flavors:
-        prompt_ids, n_dec = tokenized[name]
-        print(f"\n########## flavor: {name}  "
-              f"(prompt {prompt_ids.shape[1]} toks, decode {n_dec}) ##########")
-        profile_flavor(name, prompt_ids, n_dec, model, kv_cache, backend)
+    for run_name, prompt_ids, n_dec in runs:
+        B, T = prompt_ids.shape
+        print(f"\n########## run: {run_name}  "
+              f"(batch {B}, prompt {T} toks, decode {n_dec}) ##########")
+        profile_flavor(run_name, prompt_ids, n_dec, model, kv_cache, backend,
+                       tensorboard=args.tensorboard)
 
 
 if __name__ == "__main__":
