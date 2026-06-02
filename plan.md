@@ -771,7 +771,7 @@ trading worst-case for tail-case.
 
 ---
 
-## Section 19 — CUDA Graphs  *(decode-path latency killer)*
+## Section 19 — CUDA Graphs (and torch.compile)  *(decode-path latency killer)*
 
 **Builds on:** Section 15+ (any combination of 16/17/18). Works with the
 Section 11 contiguous KV cache and with PagedKVCache — both pre-allocate
@@ -784,6 +784,12 @@ A single decode token through 28 layers issues ~300 CUDA kernel launches.
 At ~5-10 µs launch overhead each, that's 1.5-3 ms per token of pure launch
 cost — often **larger than the actual GPU compute** for small-batch decode.
 The CPU becomes the bottleneck even though the GPU is sitting half-idle.
+
+**Alternative / First Step: `torch.compile`**
+Before implementing a manual CUDA Graph pool, we can start by applying PyTorch's native compilation:
+- **How it helps:** `compiled_model = torch.compile(model)` uses TorchDynamo to capture the execution graph and Inductor to fuse/compile ops.
+- **Built-in CUDA Graphs:** By setting `mode="max-autotune"` or compiler options (e.g., `options={"triton.cudagraphs": True}`), `torch.compile` automatically wraps the compiled kernels inside a CUDA Graph, bypassing the CPU dispatch and driver launch overhead.
+- **Why we still need manual CUDA Graphs:** While simple to implement, `torch.compile` struggles with the dynamic shapes, ragged tensors, and changing memory addresses inherent to serving optimizations (such as PagedAttention block tables and continuous batching). Graph breaks (due to Python control flow or sampling on the CPU) can also drop out of compiled graph mode.
 
 **Solution: capture the whole decode forward as a CUDA graph, replay it**
 - During warmup: run forward once with `torch.cuda.graph()` capturing → records
