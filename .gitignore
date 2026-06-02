@@ -6,6 +6,10 @@ __pycache__/
 profiling/out/
 # Chrome/Perfetto timeline traces (large, machine-generated)
 profiling/**/*_trace.json
+# TensorBoard PyTorch Profiler logdir + traces (large, machine-generated)
+profiling/**/tensorboard-profiler/logdir/
+profiling/**/*.pt.trace.json
+profiling/**/*.pt.trace.json.gz
 # Nsight binary reports
 profiling/**/*.nsys-rep
 profiling/**/*.ncu-rep
