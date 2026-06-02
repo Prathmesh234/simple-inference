@@ -1,0 +1,46 @@
+==============================================================================
+  ENGINE PROFILE (iteration-03 parity)  —  flavor='short_b16'
+==============================================================================
+  backend       : triton (fused kernels)
+  batch size    : 16
+  prompt tokens : 12 (per row, left-padded)
+  new tokens    : 32
+  prefill       : 44.25 ms
+  decode/step   : 53.826 ms  (297.3 tok/s over the batch)
+  peak VRAM     : 6.86 GB
+  sampling      : temperature=0.7  top_k=50  top_p=0.9
+------------------------------------------------------------------------------
+  Op table sorted by cuda_time_total (top 25)
+------------------------------------------------------------------------------
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  Total MFLOPs  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           aten::linear         2.73%      19.822ms        42.10%     305.320ms      56.457us       0.000us         0.00%     271.623ms      50.226us           0 B           0 B       1.23 GB           0 B          5408            --  
+                                           aten::matmul         7.14%      51.815ms        34.71%     251.772ms      46.555us       0.000us         0.00%     271.623ms      50.226us           0 B           0 B       1.23 GB           0 B          5408            --  
+                                               aten::mm        18.76%     136.041ms        24.30%     176.252ms      32.591us     271.598ms        86.81%     271.623ms      50.226us           0 B           0 B       1.23 GB       1.23 GB          5408   4420502.815  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us     261.325ms        83.53%     261.325ms      49.881us           0 B           0 B           0 B           0 B          5239            --  
+                                            aten::copy_         5.90%      42.817ms        10.59%      76.803ms      13.734us      10.903ms         3.49%      10.903ms       1.950us           0 B           0 B           0 B           0 B          5592            --  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       8.297ms         2.65%       8.297ms       2.279us           0 B           0 B           0 B           0 B          3640            --  
+                                       cuLaunchKernelEx         4.84%      35.070ms         5.13%      37.201ms       6.879us       6.479ms         2.07%       6.479ms       1.198us           0 B           0 B           0 B           0 B          5408            --  
+                                             _flash_fwd         0.00%       0.000us         0.00%       0.000us       0.000us       6.185ms         1.98%       6.185ms       6.903us           0 B           0 B           0 B           0 B           896            --  
+                                            aten::clone         1.37%       9.936ms         6.44%      46.687ms      24.418us       0.000us         0.00%       5.329ms       2.787us           0 B           0 B       2.29 GB           0 B          1912            --  
+                                       aten::contiguous         0.54%       3.912ms         6.74%      48.853ms      26.435us       0.000us         0.00%       5.110ms       2.765us           0 B           0 B       2.10 GB           0 B          1848            --  
+                                             aten::sort         0.31%       2.251ms         0.78%       5.626ms     175.813us       4.469ms         1.43%       4.550ms     142.201us           0 B           0 B     627.54 MB     627.54 MB            32            --  
+ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f...         0.00%       0.000us         0.00%       0.000us       0.000us       4.462ms         1.43%       4.462ms     159.346us           0 B           0 B           0 B           0 B            28            --  
+                                           aten::cumsum         0.05%     373.464us         0.08%     557.867us      17.433us       4.405ms         1.41%       4.405ms     137.655us           0 B           0 B     125.25 MB     125.25 MB            32            --  
+void at::native::tensor_kernel_scan_innermost_dim<c1...         0.00%       0.000us         0.00%       0.000us       0.000us       4.405ms         1.41%       4.405ms     137.655us           0 B           0 B           0 B           0 B            32            --  
+void cutlass::Kernel2<cutlass_80_tensorop_bf16_s1681...         0.00%       0.000us         0.00%       0.000us       0.000us       3.938ms         1.26%       3.938ms      46.881us           0 B           0 B           0 B           0 B            84            --  
+                                           _rmsnorm_fwd         0.00%       0.000us         0.00%       0.000us       0.000us       2.881ms         0.92%       2.881ms       1.579us           0 B           0 B           0 B           0 B          1824            --  
+                                          aten::softmax         0.02%     155.715us         0.16%       1.161ms      18.140us       0.000us         0.00%       2.515ms      39.294us           0 B           0 B     381.16 MB           0 B            64            --  
+                                         aten::_softmax         0.09%     660.214us         0.14%       1.005ms      15.707us       2.515ms         0.80%       2.515ms      39.294us           0 B           0 B     381.16 MB     381.16 MB            64            --  
+                                               aten::to         0.46%       3.368ms         6.97%      50.526ms      27.223us       0.000us         0.00%       2.166ms       1.167us           0 B           0 B     254.43 MB           0 B          1856            --  
+                                         aten::_to_copy         1.62%      11.725ms         6.50%      47.158ms      25.854us       0.000us         0.00%       2.166ms       1.188us           0 B           0 B     254.43 MB           0 B          1824            --  
+                                              _rope_fwd         0.00%       0.000us         0.00%       0.000us       0.000us       2.160ms         0.69%       2.160ms       1.206us           0 B           0 B           0 B           0 B          1792            --  
+                                              aten::add         3.42%      24.804ms         5.04%      36.571ms      20.408us       2.082ms         0.67%       2.082ms       1.162us           0 B           0 B     274.75 MB     274.75 MB          1792       118.358  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.082ms         0.67%       2.082ms       1.162us           0 B           0 B           0 B           0 B          1792            --  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.987ms         0.63%       1.987ms       1.109us           0 B           0 B           0 B           0 B          1792            --  
+                                      aten::multinomial         0.19%       1.366ms         1.20%       8.711ms     272.214us       0.000us         0.00%       1.945ms      60.785us           0 B           0 B      16.00 KB    -253.56 MB            32            --  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 725.279ms
+Self CUDA time total: 312.857ms
+
