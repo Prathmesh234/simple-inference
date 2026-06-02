@@ -12,3 +12,9 @@ dependencies = [
     "numpy>=1.26.0",
     "accelerate>=0.26.0",
 ]
+
+[dependency-groups]
+dev = [
+    "tensorboard>=2.20.0",
+    "torch-tb-profiler>=0.4.3",
+]
