@@ -1,0 +1,46 @@
+==============================================================================
+  ENGINE PROFILE (iteration-03 parity)  —  flavor='short_b32'
+==============================================================================
+  backend       : triton (fused kernels)
+  batch size    : 32
+  prompt tokens : 12 (per row, left-padded)
+  new tokens    : 32
+  prefill       : 42.31 ms
+  decode/step   : 41.234 ms  (776.1 tok/s over the batch)
+  peak VRAM     : 7.00 GB
+  sampling      : temperature=0.7  top_k=50  top_p=0.9
+------------------------------------------------------------------------------
+  Op table sorted by cuda_time_total (top 25)
+------------------------------------------------------------------------------
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  Total MFLOPs  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                           aten::linear         2.38%      17.451ms        45.27%     331.817ms      61.357us       0.000us         0.00%     278.111ms      51.426us           0 B           0 B       2.32 GB           0 B          5408            --  
+                                           aten::matmul         7.18%      52.641ms        38.28%     280.608ms      51.887us       0.000us         0.00%     278.111ms      51.426us           0 B           0 B       2.32 GB           0 B          5408            --  
+                                               aten::mm        19.87%     145.648ms        28.00%     205.272ms      37.957us     278.100ms        83.75%     278.111ms      51.426us           0 B           0 B       2.32 GB       2.32 GB          5408   8841005.629  
+void cutlass::Kernel2<cutlass_80_tensorop_bf16_s1681...         0.00%       0.000us         0.00%       0.000us       0.000us     129.099ms        38.88%     129.099ms      47.974us           0 B           0 B           0 B           0 B          2691            --  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us     114.723ms        34.55%     114.723ms     132.169us           0 B           0 B           0 B           0 B           868            --  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      15.775ms         4.75%      15.775ms       9.087us           0 B           0 B           0 B           0 B          1736            --  
+                                            aten::copy_         5.71%      41.846ms        10.18%      74.611ms      13.342us      13.638ms         4.11%      13.638ms       2.439us           0 B           0 B           0 B           0 B          5592            --  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      10.638ms         3.20%      10.638ms       2.922us           0 B           0 B           0 B           0 B          3640            --  
+                                             _flash_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      10.031ms         3.02%      10.031ms      11.195us           0 B           0 B           0 B           0 B           896            --  
+                                             aten::sort         0.30%       2.204ms         0.75%       5.504ms     172.007us       8.667ms         2.61%       8.795ms     274.850us           0 B           0 B       1.22 GB       1.22 GB            32            --  
+ampere_bf16_s1688gemm_bf16_64x128_sliced1x2_ldg8_f2f...         0.00%       0.000us         0.00%       0.000us       0.000us       8.040ms         2.42%       8.040ms     277.252us           0 B           0 B           0 B           0 B            29            --  
+                                            aten::clone         1.18%       8.616ms         6.20%      45.474ms      23.783us       0.000us         0.00%       7.743ms       4.049us           0 B           0 B       3.91 GB           0 B          1912            --  
+                                       aten::contiguous         0.42%       3.068ms         6.38%      46.802ms      25.326us       0.000us         0.00%       7.367ms       3.986us           0 B           0 B       3.54 GB           0 B          1848            --  
+void cublasLt::splitKreduce_kernel<32, 16, int, __nv...         0.00%       0.000us         0.00%       0.000us       0.000us       6.079ms         1.83%       6.079ms       1.383us           0 B           0 B           0 B           0 B          4396            --  
+                                           aten::cumsum         0.05%     384.997us         0.08%     580.741us      18.148us       4.410ms         1.33%       4.410ms     137.822us           0 B           0 B     250.50 MB     250.50 MB            32            --  
+void at::native::tensor_kernel_scan_innermost_dim<c1...         0.00%       0.000us         0.00%       0.000us       0.000us       4.410ms         1.33%       4.410ms     137.822us           0 B           0 B           0 B           0 B            32            --  
+ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f...         0.00%       0.000us         0.00%       0.000us       0.000us       3.246ms         0.98%       3.246ms     115.922us           0 B           0 B           0 B           0 B            28            --  
+void at_cuda_detail::cub::detail::radix_sort::Device...         0.00%       0.000us         0.00%       0.000us       0.000us       3.160ms         0.95%       3.160ms      32.918us           0 B           0 B           0 B           0 B            96            --  
+                                           _rmsnorm_fwd         0.00%       0.000us         0.00%       0.000us       0.000us       3.052ms         0.92%       3.052ms       1.673us           0 B           0 B           0 B           0 B          1824            --  
+                                          aten::softmax         0.02%     144.065us         0.15%       1.092ms      17.058us       0.000us         0.00%       2.534ms      39.596us           0 B           0 B     754.25 MB           0 B            64            --  
+                                         aten::_softmax         0.08%     616.844us         0.13%     947.625us      14.807us       2.534ms         0.76%       2.534ms      39.596us           0 B           0 B     754.25 MB     754.25 MB            64            --  
+                                              _rope_fwd         0.00%       0.000us         0.00%       0.000us       0.000us       2.420ms         0.73%       2.420ms       1.351us           0 B           0 B           0 B           0 B          1792            --  
+                                              aten::add         3.37%      24.708ms         4.89%      35.828ms      19.993us       2.388ms         0.72%       2.388ms       1.333us           0 B           0 B     451.50 MB     451.50 MB          1792       236.716  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.388ms         0.72%       2.388ms       1.333us           0 B           0 B           0 B           0 B          1792            --  
+                                               aten::to         0.48%       3.514ms         6.58%      48.239ms      25.991us       0.000us         0.00%       2.273ms       1.225us           0 B           0 B     502.01 MB           0 B          1856            --  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 733.037ms
+Self CUDA time total: 332.074ms
+
