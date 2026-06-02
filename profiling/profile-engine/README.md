@@ -61,6 +61,49 @@ as the kernel reports:
 |------|----------|
 | `out/profiler_engine_<flavor>.txt` | banner + summary block (prompt/new tokens, prefill ms, decode ms/step, peak VRAM, sampling) + `key_averages` op table sorted by `cuda_time_total` |
 | `out/engine_<flavor>_trace.json` | Chrome/Perfetto timeline (open at `chrome://tracing` or `ui.perfetto.dev`) |
+| `tensorboard-profiler/logdir/<flavor>/*.pt.trace.json` | TensorBoard PyTorch Profiler trace (written by `tensorboard_trace_handler`) |
 
-`nsys-profiler/out/` and `tensorboard-profiler/` are reserved for the same
-out/-folder convention when those drivers are added.
+TensorBoard output is on by default; pass `--no-tensorboard` to skip it.
+
+`nsys-profiler/out/` is reserved for the same out/-folder convention when that
+driver is added.
+
+## Viewing the trace (two UIs)
+
+The same run feeds **two** trace viewers, matching the HF "Profiling in PyTorch"
+blog (which reads traces in the Perfetto UI):
+
+### 1. TensorBoard PyTorch Profiler plugin
+
+```bash
+uv run tensorboard --logdir profiling/profile-engine/tensorboard-profiler/logdir
+# then open http://localhost:6006  →  "PYTORCH_PROFILER" tab
+```
+
+Each flavor shows up as its own run (`short`, `long`, …) with the overview,
+operator, kernel, and trace views.
+
+### 2. Perfetto UI (the blog's trace viewer)
+
+`out/engine_<flavor>_trace.json` is already a Perfetto-compatible Chrome trace
+(CPU lane, GPU lane, and the dispatch flow arrows between them). Two ways to open
+it:
+
+- **Drag-and-drop:** download the `.json` and drop it onto
+  [`ui.perfetto.dev`](https://ui.perfetto.dev).
+- **Serve it locally** (no third-party upload) with the helper, which prints a
+  ready-to-open Perfetto deep link:
+
+  ```bash
+  uv run python profiling/profile-engine/torch-profiler/serve_trace.py --flavor short
+  ```
+
+  On a remote box, forward the port first so your local browser can fetch it:
+
+  ```bash
+  ssh -L 9001:localhost:9001 <user>@<host>
+  ```
+
+> The blog also mentions `uvx trace-util traces -b traces`; that uploads your
+> traces to a Hugging Face bucket to mint a shareable Perfetto link. The
+> `serve_trace.py` helper above keeps everything local instead.
