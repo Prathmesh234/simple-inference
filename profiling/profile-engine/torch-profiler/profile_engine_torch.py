@@ -268,6 +268,8 @@ def profile_flavor(name: str, prompt_ids: torch.Tensor, n_new_tokens: int,
     # Warm up this prompt shape OUTSIDE the profiler (matches 03's WARMUP=2):
     # absorbs the one-time Triton JIT + autotune sweep so the captured run is
     # steady-state.
+    ##here we are warming up the engine with th eprompt ids that we need 
+    ## basically warming it up for autotuning 
     for _ in range(WARMUP):
         prefill_and_decode(model, kv_cache, prompt_ids, min(n_new_tokens, 4))
     torch.cuda.synchronize()
