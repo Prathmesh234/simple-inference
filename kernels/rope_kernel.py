@@ -64,12 +64,19 @@ traffic and the 2D indexing overhead outweighed the BW saving.
 
 from __future__ import annotations
 
+import os
 import torch
 import triton
 import triton.language as tl
 
+USE_AUTOTUNE = os.environ.get("USE_AUTOTUNE", "true").lower() in ("1", "true", "yes", "on")
 
-@triton.autotune(
+def conditional_autotune(configs, key):
+    if not USE_AUTOTUNE:
+        configs = [configs[0]]
+    return triton.autotune(configs, key)
+
+@conditional_autotune(
     configs=[
         triton.Config({}, num_warps=1, num_stages=1),
         triton.Config({}, num_warps=2, num_stages=1),
