@@ -64,6 +64,7 @@ from ops.rope import RopeFrequencies, apply_rope
 #   Defaults to True — the Triton FlashAttention kernel is the production path.
 #   Set USE_TRITON=false to force PyTorch's fused SDPA (useful for parity checks).
 USE_TRITON = os.environ.get("USE_TRITON", "true").lower() in ("1", "true", "yes", "on")
+FUSE_TRANSPOSE = os.environ.get("FUSE", "true").lower() in ("1", "true", "yes", "on")
 
 
 class GroupedQueryAttention(nn.Module):
@@ -158,7 +159,11 @@ class GroupedQueryAttention(nn.Module):
 
         if USE_TRITON and q.is_cuda:
             from kernels.attention_kernel import attention_flash_triton
-            out = attention_flash_triton(q, k, v, causal=causal)
+            if FUSE_TRANSPOSE:
+                out = attention_flash_triton(q, k, v, causal=causal, return_transposed=True)
+            else:
+                out = attention_flash_triton(q, k, v, causal=causal, return_transposed=False)
+                out = out.transpose(1, 2)  # (B, T, n_heads_q, head_dim)
         else:
             if self.num_kv_groups > 1:
                 k = k.repeat_interleave(self.num_kv_groups, dim=1)
@@ -169,10 +174,11 @@ class GroupedQueryAttention(nn.Module):
                 dropout_p=0.0,
                 is_causal=causal,
             )
-        # out: (B, n_heads_q, T, head_dim)
+            out = out.transpose(1, 2)  # (B, T, n_heads_q, head_dim)
 
         # --- 8. Merge heads and project output ---
-        out = out.transpose(1, 2).contiguous()       # (B, T, n_heads_q, head_dim)
+        if not out.is_contiguous():
+            out = out.contiguous()
         out = out.view(B, T, self.num_heads_q * self.head_dim)  # (B, T, hidden)
         out = F.linear(out, self.wo)                 # (B, T, hidden)
 
