@@ -58,9 +58,18 @@ PyTorch reference, including chunked-prefill (Tq < Tk) shapes.
 
 from __future__ import annotations
 
+import os
 import torch
 import triton
 import triton.language as tl
+
+USE_AUTOTUNE = os.environ.get("USE_AUTOTUNE", "true").lower() in ("1", "true", "yes", "on")
+
+def conditional_autotune(configs, key):
+    if not USE_AUTOTUNE:
+        configs = [configs[0]]
+    return triton.autotune(configs, key)
+
 
 
 # ===========================================================================
@@ -86,7 +95,7 @@ def _flash_configs():
 #   ~1.7s stall per token measured on RTX 6000 Ada), destroying TPOT. head_dim
 #   and causal-ness are what actually determine the best block/warp config, so
 #   we tune once per (D, CAUSAL) and reuse the result for all sequence lengths.
-@triton.autotune(configs=_flash_configs(), key=["D", "CAUSAL"])
+@conditional_autotune(configs=_flash_configs(), key=["D", "CAUSAL"])
 @triton.jit
 def _flash_fwd(
     q_ptr, k_ptr, v_ptr, o_ptr, sm_scale,
@@ -239,6 +248,7 @@ def attention_flash_triton(
     causal: bool,
     sm_scale: float | None = None,
     assume_contiguous: bool = False,
+    return_transposed: bool = False,
 ) -> torch.Tensor:
     """
     FlashAttention-2 forward in Triton. Drop-in for
@@ -251,13 +261,15 @@ def attention_flash_triton(
         causal:   apply the causal mask (with a Tk-Tq query offset)
         sm_scale: 1/sqrt(D) if None
         assume_contiguous: skip the per-call `.contiguous()` on q/k/v. The
-            kernel indexes with explicit strides, so it only needs the tensors
-            to be contiguous so Triton's pointer arithmetic is valid. Hot paths
-            that already guarantee contiguous inputs (e.g. the decode KV-cache
-            path) can pass True to drop the per-call CPU check/copy. Leave False
-            (default) when inputs may be views/transposed — correctness first.
+            kernel indexes with explicit strides, so it only requires the tensors
+            to be contiguous in their last dimension (head_dim) for coalesced access.
+            Hot paths that already guarantee contiguous inputs can pass True to
+            drop the per-call CPU checks.
+        return_transposed: if True, writes output directly to (B, Tq, Hq, D) shape
+            and returns it (zero-copy transposition), avoiding subsequent .transpose().contiguous().
     Returns:
-        (B, Hq, Tq, D), same dtype as q
+        If return_transposed is True: (B, Tq, Hq, D) contiguous tensor
+        Else: (B, Hq, Tq, D) tensor
     """
     B, Hq, Tq, D = q.shape
     _, Hkv, Tk, _ = k.shape
@@ -268,17 +280,36 @@ def attention_flash_triton(
         sm_scale = 1.0 / (D ** 0.5)
 
     if not assume_contiguous:
-        q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
-    out = torch.empty_like(q)
+        if q.stride(-1) != 1:
+            q = q.contiguous()
+        if k.stride(-1) != 1:
+            k = k.contiguous()
+        if v.stride(-1) != 1:
+            v = v.contiguous()
 
     grid = lambda meta: (triton.cdiv(Tq, meta["BLOCK_M"]), B * Hq)
-    _flash_fwd[grid](
-        q, k, v, out, sm_scale,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        Hq, Tq, Tk, KV_GROUP,
-        D=D, CAUSAL=causal,
-    )
+
+    if return_transposed:
+        out = torch.empty((B, Tq, Hq, D), dtype=q.dtype, device=q.device)
+        _flash_fwd[grid](
+            q, k, v, out, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(2), out.stride(1), out.stride(3),
+            Hq, Tq, Tk, KV_GROUP,
+            D=D, CAUSAL=causal,
+        )
+    else:
+        out = torch.empty_like(q)
+        _flash_fwd[grid](
+            q, k, v, out, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            Hq, Tq, Tk, KV_GROUP,
+            D=D, CAUSAL=causal,
+        )
     return out
+
