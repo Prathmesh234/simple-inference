@@ -107,7 +107,7 @@ def generate(
             if pos >= kv_cache.max_seq_len:
                 break
             tok_tensor = torch.tensor([[next_tok_id]], dtype=torch.long, device=device)
-            logits = model(tok_tensor, start_pos=pos, kv_cache=kv_cache)
+            logits = model.decode_step(tok_tensor, pos, kv_cache)
             next_tok_id = sample(
                 logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
             ).item()
@@ -196,7 +196,7 @@ def generate_with_stats(
                     tok_tensor = torch.tensor([[next_tok_id]], dtype=torch.long, device=device)
                     torch.cuda.synchronize()
                     ts = time.perf_counter()
-                    logits = model(tok_tensor, start_pos=pos, kv_cache=kv_cache)
+                    logits = model.decode_step(tok_tensor, pos, kv_cache)
                     torch.cuda.synchronize()
                     decode_times.append((time.perf_counter() - ts) * 1000)
 
@@ -246,6 +246,7 @@ if __name__ == "__main__":
     import env_loader  # noqa: F401  loads .env for HF_TOKEN
     from config import ModelConfig
     from loader import WeightLoader
+    import model.llama as llama_mod
 
     DEVICE   = "cuda"
     DTYPE    = torch.bfloat16
@@ -275,6 +276,8 @@ if __name__ == "__main__":
     model.load_weights(loader)
     model.to(DEVICE, DTYPE)
     model.eval()
+    if model.maybe_compile():
+        print(f"  torch.compile: enabled (mode={llama_mod.COMPILE_MODE})")
 
     kv = KVCache(
         n_layers    = cfg.num_hidden_layers,
