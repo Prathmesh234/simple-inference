@@ -218,14 +218,14 @@ def banner(title: str):
 # builder) so importing profile_utils on a CPU-only box stays cheap.
 # ---------------------------------------------------------------------------
 def _attention_regimes():
-    from kernels.attention_kernel import attention_flash_triton
+    from kernels.attention_kernel import attention_prefill_triton
     qp, kp, vp = make_prefill_qkv(B=16, T=1024)
     qd, kd, vd = make_decode_qkv(B=16, Tk=2048)
     return [
         ("PREFILL B=1 T=1024 causal", "attn_prefill",
-         lambda: attention_flash_triton(qp, kp, vp, causal=True, assume_contiguous=True)),
+         lambda: attention_prefill_triton(qp, kp, vp, causal=True, assume_contiguous=True)),
         ("DECODE  B=1 Tq=1 Tk=2048", "attn_decode",
-         lambda: attention_flash_triton(qd, kd, vd, causal=False, assume_contiguous=True)),
+         lambda: attention_prefill_triton(qd, kd, vd, causal=False, assume_contiguous=True)),
     ]
 
 

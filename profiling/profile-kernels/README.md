@@ -124,7 +124,7 @@ uv pip install tensorboard torch-tb-profiler
 | Why is this kernel slow internally? | `ncu` registers / cache / warp metrics |
 
 ## A note carried over from the autotune fix
-`_flash_fwd` is autotuned with `key=["D", "CAUSAL"]` — deliberately **not**
+`_flash_prefill_fwd` is autotuned with `key=["D", "CAUSAL"]` — deliberately **not**
 `Tk`. Including `Tk` (which grows every decode token) forced a full re-tune per
 token (~1.7s each). Final config selection / persistence is intentionally
 deferred to the CUDA-graphs phase, where fixed block sizes are needed for graph
