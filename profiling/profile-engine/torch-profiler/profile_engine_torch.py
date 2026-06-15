@@ -62,6 +62,7 @@ from transformers import AutoTokenizer  # noqa: E402
 from config import ModelConfig  # noqa: E402
 from loader import WeightLoader  # noqa: E402
 from model.llama import LlamaModel  # noqa: E402
+import model.llama as llama_mod  # noqa: E402
 from model.kv_cache import KVCache  # noqa: E402
 from sampling import sample  # noqa: E402
 import ops.rmsnorm as rmsnorm_mod  # noqa: E402
@@ -128,7 +129,7 @@ def prefill_and_decode(
     for _ in range(n_new_tokens - 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        logits   = model(next_tok, start_pos=pos, kv_cache=kv_cache)
+        logits   = model.decode_step(next_tok, pos, kv_cache)
         next_tok = sample(
             logits[:, -1, :], temperature=TEMPERATURE, top_k=TOP_K, top_p=TOP_P
         ).unsqueeze(-1)
@@ -183,6 +184,8 @@ def build_model() -> tuple[LlamaModel, ModelConfig]:
     model.load_weights(loader)
     model.to(DEVICE, DTYPE)
     model.eval()
+    if model.maybe_compile():
+        print(f"  torch.compile: enabled (mode={llama_mod.COMPILE_MODE})")
     return model, cfg
 
 
@@ -256,7 +259,7 @@ def _render_report(name: str, backend: str, batch: int, prompt_tokens: int,
         f"  peak VRAM     : {peak_vram_gb:.2f} GB\n"
         f"  sampling      : temperature={TEMPERATURE}  top_k={TOP_K}  top_p={TOP_P}\n"
         f"{rule}\n"
-        f"  Op table sorted by cuda_time_total (top 25)\n"
+        f"  Op table sorted by cuda_time_total (top 100)\n"
         f"{rule}\n"
         f"{table}\n"
     )
@@ -268,20 +271,35 @@ def profile_flavor(name: str, prompt_ids: torch.Tensor, n_new_tokens: int,
     # Warm up this prompt shape OUTSIDE the profiler (matches 03's WARMUP=2):
     # absorbs the one-time Triton JIT + autotune sweep so the captured run is
     # steady-state.
-    ##here we are warming up the engine with th eprompt ids that we need 
-    ## basically warming it up for autotuning 
+    #
+    # CUDA-graph note: when USE_CUDA_GRAPHS is on, the decode graph must be
+    # captured HERE, in warmup, not inside the profiled region — capture is
+    # heavy one-time work (buffer alloc + internal warmup + record) that would
+    # otherwise pollute the op table. CUDAGraphDecoder already warms up
+    # internally, so we don't add our own decode warmup loop; we just:
+    #   1. reset any graph from a previous flavor (batch size differs per flavor)
+    #   2. capture explicitly via warmup_decode_graph (no-op unless graphs on)
+    #   3. freeze, so an accidental capture inside `profile(...)` raises instead
+    #      of silently landing in the trace.
+    B = prompt_ids.shape[0]
+    model.reset_graph()
     for _ in range(WARMUP):
         prefill_and_decode(model, kv_cache, prompt_ids, min(n_new_tokens, 4))
+    model.warmup_decode_graph(kv_cache, B, prompt_ids.shape[1])
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats(DEVICE)
 
-    with profile(activities=ACTIVITIES, record_shapes=True,
-                 profile_memory=True, with_flops=True) as prof:
-        _, prefill_ms, decode_ms = prefill_and_decode(
-            model, kv_cache, prompt_ids, n_new_tokens)
+    model.freeze_graph(True)
+    try:
+        with profile(activities=ACTIVITIES, record_shapes=True,
+                     profile_memory=True, with_flops=True) as prof:
+            _, prefill_ms, decode_ms = prefill_and_decode(
+                model, kv_cache, prompt_ids, n_new_tokens)
+    finally:
+        model.freeze_graph(False)
 
     peak_vram_gb = torch.cuda.max_memory_allocated(DEVICE) / 1e9
-    table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=25)
+    table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=100)
 
     report = _render_report(name, backend, prompt_ids.shape[0], prompt_ids.shape[1],
                             n_new_tokens, prefill_ms, decode_ms, peak_vram_gb, table)
@@ -327,7 +345,9 @@ def main():
     assert torch.cuda.is_available(), "CUDA required to profile the inference engine"
 
     backend = "triton (fused kernels)" if rmsnorm_mod.USE_TRITON else "pytorch (reference)"
-    print(f"  Backend : {backend}    [override with USE_TRITON=true/false in .env]")
+    if llama_mod.USE_CUDA_GRAPHS:
+        backend += " + cuda-graph decode"
+    print(f"  Backend : {backend}    [override with USE_TRITON / USE_CUDA_GRAPHS in .env]")
     print(f"  Sampling: temperature={TEMPERATURE}, top_k={TOP_K}, top_p={TOP_P}")
 
     prompts = load_prompts()
