@@ -118,6 +118,12 @@ class GroupedQueryAttention(nn.Module):
         """
         B, T, _ = x.shape
 
+        # CUDA-graph decode path (set by model/cuda_graph.py during capture).
+        # All position-dependent inputs come from static GPU buffers so the
+        # whole decode step can be captured once and replayed: RoPE cos/sin for
+        # the current position, the KV write index, and the key-length mask.
+        gstate = getattr(kv_cache, "graph", None) if kv_cache is not None else None
+
         # --- 1. Project to Q, K, V ---
         q = F.linear(x, self.wq)  # (B, T, n_heads_q  * head_dim)
         k = F.linear(x, self.wk)  # (B, T, n_heads_kv * head_dim)
@@ -129,15 +135,48 @@ class GroupedQueryAttention(nn.Module):
         v = v.view(B, T, self.num_heads_kv, self.head_dim)
 
         # --- 3. Apply RoPE to Q and K ---
-        cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos)
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
+        if gstate is not None:
+            # Static cos/sin for the current decode position (filled in-place
+            # before each replay). Still uses the custom Triton RoPE kernel.
+            cos, sin = gstate.cos, gstate.sin
+        else:
+            cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos)
+            cos = cos.to(x.dtype)
+            sin = sin.to(x.dtype)
         q, k = apply_rope(q, k, cos, sin)
 
         # --- 4. Transpose to (B, n_heads, T, head_dim) for SDPA ---
         q = q.transpose(1, 2)  # (B, n_heads_q,  T, head_dim)
         k = k.transpose(1, 2)  # (B, n_heads_kv, T, head_dim)
         v = v.transpose(1, 2)  # (B, n_heads_kv, T, head_dim)
+
+        if gstate is not None:
+            # Fixed-shape decode attention for CUDA-graph capture: write the new
+            # K/V into the cache at the (GPU-resident) position and read the WHOLE
+            # fixed-length cache. Attention then masks slots beyond the current
+            # position. Both backends below are CUDA-graph capturable because the
+            # cache shape is static and the position comes from a tensor:
+            #   * USE_TRITON: the custom CUDA-graph decode kernel
+            #     (attention_decode_triton) reads cur_pos from a pointer and
+            #     loops a compile-time-constant KV_LEN — so one captured graph
+            #     serves every decode position.
+            #   * else: SDPA with an additive length mask + enable_gqa.
+            k, v = kv_cache.update_graph(self.layer_idx, gstate.cur_pos, k, v)
+            if USE_TRITON and q.is_cuda:
+                from kernels.attention_kernel import attention_decode_triton
+                out = attention_decode_triton(q, k, v, gstate.cur_pos)
+            else:
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=gstate.attn_mask,
+                    dropout_p=0.0,
+                    enable_gqa=(self.num_kv_groups > 1),
+                )
+            out = out.transpose(1, 2)  # (B, T, n_heads_q, head_dim)
+            if not out.is_contiguous():
+                out = out.contiguous()
+            out = out.view(B, T, self.num_heads_q * self.head_dim)
+            return F.linear(out, self.wo)
 
         # --- 5. KV cache update (Section 11) ---
         # During prefill (start_pos=0): writes [0, T), returns [0, T) → standard self-attention.
@@ -146,7 +185,11 @@ class GroupedQueryAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, start_pos, k, v)
 
-        # --- 6. Attention ---
+        # --- 6. Attention (eager execution: prefill, or decode without CUDA graphs) ---
+        # NOTE: attention_prefill_triton is the variable-length kernel. Despite the
+        # "prefill" name it ALSO serves eager decode (T==1) — only the captured
+        # CUDA-graph decode path above uses the separate attention_decode_triton.
+        #
         # Triton FlashAttention handles GQA internally (maps each Q head to its
         # KV head), so we pass the un-repeated K/V. The PyTorch SDPA path needs
         # K/V repeated up to the Q head count first.
@@ -158,11 +201,11 @@ class GroupedQueryAttention(nn.Module):
         causal = (T > 1)
 
         if USE_TRITON and q.is_cuda:
-            from kernels.attention_kernel import attention_flash_triton
+            from kernels.attention_kernel import attention_prefill_triton
             if FUSE_TRANSPOSE:
-                out = attention_flash_triton(q, k, v, causal=causal, return_transposed=True)
+                out = attention_prefill_triton(q, k, v, causal=causal, return_transposed=True)
             else:
-                out = attention_flash_triton(q, k, v, causal=causal, return_transposed=False)
+                out = attention_prefill_triton(q, k, v, causal=causal, return_transposed=False)
                 out = out.transpose(1, 2)  # (B, T, n_heads_q, head_dim)
         else:
             if self.num_kv_groups > 1:
