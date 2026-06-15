@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import torch
 import torch.nn.functional as F
 
-from kernels.attention_kernel import attention_flash_triton
+from kernels.attention_kernel import attention_prefill_triton
 from benchmarks.bench_utils import bench_fn
 
 DEVICE   = "cuda"
@@ -72,7 +72,7 @@ def main():
     torch.manual_seed(0)
     q, k, v = make_qkv(1, 256)
     ref = sdpa_ref(q, k, v, causal=True)
-    got = attention_flash_triton(q, k, v, causal=True)
+    got = attention_prefill_triton(q, k, v, causal=True)
     diff = (got - ref).abs().max().item()
     print(f"  flash  max |triton - sdpa| = {diff:.2e}   "
           f"[{'PASS' if diff < 5e-2 else 'FAIL'}]")
@@ -85,7 +85,7 @@ def main():
     vd = torch.randn(1, N_KV, Tk, HEAD_DIM, device=DEVICE, dtype=DTYPE)
     kk = kd.repeat_interleave(KV_GROUP, dim=1); vv = vd.repeat_interleave(KV_GROUP, dim=1)
     ref_d = F.scaled_dot_product_attention(qd, kk, vv, is_causal=False)
-    got_d = attention_flash_triton(qd, kd, vd, causal=False)
+    got_d = attention_prefill_triton(qd, kd, vd, causal=False)
     diff = (got_d - ref_d).abs().max().item()
     print(f"  flash  max |triton - sdpa| = {diff:.2e}   "
           f"[{'PASS' if diff < 5e-2 else 'FAIL'}]")
@@ -107,10 +107,10 @@ def main():
         q, k, v = make_qkv(B, T)
 
         for _ in range(3):
-            attention_flash_triton(q, k, v, causal=True)
+            attention_prefill_triton(q, k, v, causal=True)
             sdpa_ref(q, k, v, causal=True)
 
-        lat_flash = bench_fn(lambda: attention_flash_triton(q, k, v, causal=True))
+        lat_flash = bench_fn(lambda: attention_prefill_triton(q, k, v, causal=True))
         lat_sdpa  = bench_fn(lambda: sdpa_ref(q, k, v, causal=True))
 
         tc = attn_flops(B, T) / (lat_flash / 1000) / 1e12 / PEAK_TFLOPS * 100

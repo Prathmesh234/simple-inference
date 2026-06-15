@@ -5,7 +5,8 @@
 # you which kernel is the bottleneck — ncu is slow (it replays each kernel many
 # times) so you target one kernel, not a whole run.
 #
-# --kernel-name regex restricts profiling to our Triton kernel (_flash_fwd...);
+# --kernel-name regex restricts profiling to our Triton kernel (_flash_prefill_fwd
+# / _flash_decode_fwd ...);
 # --launch-count limits how many launches are captured. `--set full` collects
 # the complete metric set (registers, cache hit rates, warp efficiency, memory
 # throughput) — the "why is this kernel slow internally" answer.
@@ -30,7 +31,7 @@ KERNEL=${KERNEL:-attention}
 # Map each registered kernel to its Triton JIT function name (the symbol ncu
 # matches). Override with KERNEL_REGEX=... if you target something else.
 case "$KERNEL" in
-  attention) DEFAULT_REGEX="_flash_fwd" ;;
+  attention) DEFAULT_REGEX="_flash_.*_fwd" ;;
   rmsnorm)   DEFAULT_REGEX="_rmsnorm_fwd" ;;
   rope)      DEFAULT_REGEX="_rope_fwd" ;;
   swiglu)    DEFAULT_REGEX="_swiglu_fwd" ;;
