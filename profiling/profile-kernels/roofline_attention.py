@@ -38,7 +38,7 @@ from profile_utils import (
     achieved_tflops, achieved_bw_gb_s,
     PEAK_TFLOPS_BF16, PEAK_BW_GB_S, RIDGE_FLOP_PER_BYTE,
 )
-from kernels.attention_kernel import attention_flash_triton
+from kernels.attention_kernel import attention_prefill_triton
 
 
 def _measure(fn) -> float:
@@ -69,12 +69,12 @@ def main():
     for T in (128, 512, 1024, 2048, 4096):
         q, k, v = make_prefill_qkv(B=1, T=T)
         rows.append(_row("prefill", 1, T, T, True,
-                         lambda q=q, k=k, v=v: attention_flash_triton(q, k, v, causal=True, assume_contiguous=True)))
+                         lambda q=q, k=k, v=v: attention_prefill_triton(q, k, v, causal=True, assume_contiguous=True)))
 
     for Tk in (128, 512, 1024, 2048, 4096):
         q, k, v = make_decode_qkv(B=1, Tk=Tk)
         rows.append(_row("decode", 1, 1, Tk, False,
-                         lambda q=q, k=k, v=v: attention_flash_triton(q, k, v, causal=False, assume_contiguous=True)))
+                         lambda q=q, k=k, v=v: attention_prefill_triton(q, k, v, causal=False, assume_contiguous=True)))
 
     banner(f"Attention roofline  (ridge = {RIDGE_FLOP_PER_BYTE:.0f} FLOP/byte, "
            f"peak {PEAK_TFLOPS_BF16:.0f} TFLOPS / {PEAK_BW_GB_S:.0f} GB/s)")

@@ -41,7 +41,7 @@ from torch.profiler import (
 from profile_utils import (
     make_prefill_qkv, make_decode_qkv, warmup, banner, OUT_DIR,
 )
-from kernels.attention_kernel import attention_flash_triton
+from kernels.attention_kernel import attention_prefill_triton
 
 ACTIVITIES = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
@@ -81,12 +81,12 @@ def main():
 
     qp, kp, vp = make_prefill_qkv(B=1, T=1024)
     _trace("PREFILL B=1 T=1024 causal", "flash_prefill",
-           lambda: attention_flash_triton(qp, kp, vp, causal=True, assume_contiguous=True),
+           lambda: attention_prefill_triton(qp, kp, vp, causal=True, assume_contiguous=True),
            "attn_prefill_trace.json")
 
     qd, kd, vd = make_decode_qkv(B=1, Tk=2048)
     _trace("DECODE  B=1 Tq=1 Tk=2048", "flash_decode",
-           lambda: attention_flash_triton(qd, kd, vd, causal=False, assume_contiguous=True),
+           lambda: attention_prefill_triton(qd, kd, vd, causal=False, assume_contiguous=True),
            "attn_decode_trace.json")
 
     print("\nTip: load both traces in Perfetto and compare the GPU stream row. "
