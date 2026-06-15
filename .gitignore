@@ -1,6 +1,7 @@
 __pycache__/
 .venv/
 .env
+!.env.example
 
 # Profiling artifacts (traces, reports, plots) — regenerate locally
 profiling/out/

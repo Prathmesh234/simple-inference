@@ -48,6 +48,7 @@ from transformers import AutoTokenizer
 from config import ModelConfig
 from loader import WeightLoader
 from model.llama import LlamaModel
+import model.llama as llama_mod
 from model.kv_cache import KVCache
 from sampling import sample
 import ops.rmsnorm as rmsnorm_mod
@@ -133,7 +134,7 @@ def prefill_and_decode(
     for _ in range(n_new_tokens - 1):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        logits   = model(next_tok, start_pos=pos, kv_cache=kv_cache)
+        logits   = model.decode_step(next_tok, pos, kv_cache)
         next_tok = sample(
             logits[:, -1, :], temperature=TEMPERATURE, top_k=TOP_K, top_p=TOP_P
         ).unsqueeze(-1)
@@ -274,6 +275,8 @@ if __name__ == "__main__":
     model.load_weights(loader)
     model.to(DEVICE, DTYPE)
     model.eval()
+    if model.maybe_compile():
+        print(f"  torch.compile: enabled (mode={llama_mod.COMPILE_MODE})")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
