@@ -461,7 +461,7 @@ ncu --set full -o kernel_report python script.py
 A FlashAttention-2 forward kernel, written to teach the **memory wall** and how
 FlashAttention clears it. (A naive materialise-the-T×T-scores version was
 prototyped to demonstrate the wall, then dropped — only flash ships.)
-- **Flash** (`attention_flash_triton`): online-softmax running state
+- **Flash** (`attention_prefill_triton`): online-softmax running state
   `(m_i, l_i, acc)` lives in registers while K/V stream in `BLOCK_N` tiles, so
   the T×T score matrix never touches HBM (O(T·d) traffic vs O(T²)). Autotuned
   over `BLOCK_M∈{64,128}`, `BLOCK_N∈{32,64}`, warps∈{4,8}, stages∈{2,3}.
