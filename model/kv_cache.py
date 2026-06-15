@@ -85,6 +85,11 @@ class KVCache:
         self.head_dim    = head_dim
         self.dtype       = dtype
         self.device      = torch.device(device)
+        # Optional CUDA-graph decode state (see model/cuda_graph.py). When set to
+        # a GraphDecodeState, `update` switches to a static, fixed-shape write so
+        # the decode step can be captured into a torch.cuda.CUDAGraph. None for
+        # the normal eager path.
+        self.graph = None
         ##this is the limitation paged attention addresses 
         ## so right now we are blocking for the entire seq len, but in reality we never know what is going to be the user 
         ## sequence request. For all you know we blocked 1024 tokens worth of KV Cache memory but the user 
@@ -134,6 +139,39 @@ class KVCache:
         k_full = self.k_cache[layer_idx, :B, :, :end, :]
         v_full = self.v_cache[layer_idx, :B, :, :end, :]
         return k_full, v_full
+
+    def update_graph(
+        self,
+        layer_idx: int,
+        pos: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        CUDA-graph-friendly decode write (T=1).
+
+        Unlike `update`, this returns a FIXED-shape view of the whole cache
+        (`[:, :, :max_seq_len, :]`) every step, so the captured graph never sees
+        a changing shape. The single new K/V is written at the GPU-resident
+        position `pos` via `index_copy_`, so the write target varies on replay
+        without re-capture (a Python-int slice would bake the position in).
+
+        Correctness during attention relies on a length mask (built in
+        GraphDecodeState) that masks out cache slots beyond `pos`.
+
+        Args:
+            layer_idx: which transformer layer
+            pos:       (1,) long tensor — absolute position of the decode token
+            k:         (B, n_heads_kv, 1, head_dim)
+            v:         (B, n_heads_kv, 1, head_dim)
+
+        Returns:
+            k_full, v_full — (B, n_heads_kv, max_seq_len, head_dim) static views.
+        """
+        B = k.shape[0]
+        self.k_cache[layer_idx, :B].index_copy_(2, pos, k.contiguous())
+        self.v_cache[layer_idx, :B].index_copy_(2, pos, v.contiguous())
+        return self.k_cache[layer_idx, :B], self.v_cache[layer_idx, :B]
 
     def reset(self) -> None:
         """
