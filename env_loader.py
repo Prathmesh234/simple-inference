@@ -20,7 +20,10 @@ def load_env():
                             # Strip outer quotes if they exist
                             if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
                                 val = val[1:-1]
-                            os.environ[key] = val
+                            # Don't clobber variables already set in the shell
+                            # environment — a real `VAR=... command` prefix should
+                            # win over .env (standard dotenv override=False).
+                            os.environ.setdefault(key, val)
             except Exception:
                 pass
             break
