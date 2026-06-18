@@ -11,6 +11,8 @@ dependencies = [
     "huggingface_hub>=0.24.0",
     "numpy>=1.26.0",
     "accelerate>=0.26.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [dependency-groups]
