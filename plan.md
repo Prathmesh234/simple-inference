@@ -75,7 +75,7 @@ Replace ops one at a time with Triton kernels. Re-run the same benchmarks after 
 
 ---
 
-## Section 4 — RMSNorm
+## ✅ Section 4 — RMSNorm  `DONE`
 
 **Class:** `RMSNorm` in `ops/rmsnorm.py`
 
@@ -99,7 +99,7 @@ Steps:
 
 ---
 
-## Section 5 — Embeddings
+## ✅ Section 5 — Embeddings  `DONE`
 
 **Classes:** `TokenEmbedding`, `OutputProjection` in `ops/embedding.py`
 
@@ -124,7 +124,7 @@ Steps:
 
 ---
 
-## Section 6 — RoPE
+## ✅ Section 6 — RoPE  `DONE`
 
 **Classes:** `RopeFrequencies`, `apply_rope` in `ops/rope.py`
 
@@ -148,7 +148,7 @@ Steps:
 
 ---
 
-## Section 7 — Attention (GQA)
+## ✅ Section 7 — Attention (GQA)  `DONE`
 
 **Class:** `GroupedQueryAttention` in `ops/attention.py`
 
@@ -173,7 +173,7 @@ Steps:
 
 ---
 
-## Section 8 — MLP (SwiGLU)
+## ✅ Section 8 — MLP (SwiGLU)  `DONE`
 
 **Class:** `SwiGLUMLP` in `ops/mlp.py`
 
@@ -198,7 +198,7 @@ Steps:
 
 ---
 
-## Section 9 — Transformer Block
+## ✅ Section 9 — Transformer Block  `DONE`
 
 **Class:** `TransformerBlock` in `model/block.py`
 
@@ -225,7 +225,7 @@ Steps:
 
 ---
 
-## Section 10 — Full Model (Prefill)
+## ✅ Section 10 — Full Model (Prefill)  `DONE`
 
 **Class:** `LlamaModel` in `model/llama.py`
 
@@ -249,7 +249,7 @@ Steps:
 
 ---
 
-## Section 11 — KV Cache
+## ✅ Section 11 — KV Cache  `DONE`
 
 **Class:** `KVCache` in `model/kv_cache.py`
 
@@ -277,7 +277,7 @@ Steps:
 
 ---
 
-## Section 12 — Sampling
+## ✅ Section 12 — Sampling  `DONE`
 
 **Functions** in `sampling.py` (no class needed — these are pure functions):
 
@@ -325,7 +325,7 @@ def generate(prompt, model, tokenizer, kv_cache, max_new_tokens,
 
 ---
 
-## Section 13.5 — Profiling  (torch.profiler → nsys → ncu)
+## ✅ Section 13.5 — Profiling  (torch.profiler → nsys → ncu)  `DONE`
 
 > **Setup ready (`profiling/`).** Scripts wired for the attention-kernel deep dive:
 > `profile_attention_torch.py` (Step 1 key_averages), `profile_attention_trace.py`
@@ -506,9 +506,9 @@ Plot the roofline: is each op compute-bound or memory-bound on RTX 6000 Ada (960
 
 ---
 
-## Section 15 — Continuous Batching + Scheduler  *(vLLM-style)*
+## Section 15 — Continuous Batching + Scheduler  *(vLLM-style)*  ✅ DONE
 
-**Files:** `serving/request.py`, `serving/scheduler.py`, `serving/engine.py`
+**Files:** `serving/request.py`, `serving/scheduler.py`, `serving/engine.py`, `serving/test_engine.py`
 
 **Problem it solves**
 Static batching pads every sequence to the longest one and waits for all
@@ -562,6 +562,34 @@ TTFT drops sharply for short requests that no longer wait behind long ones.
 
 **Learned:** iteration-level vs request-level scheduling, ragged batching,
 why the forward pass is no longer the unit of work.
+
+**Implemented (how it actually shipped)**
+Rather than refactoring the model forward to packed `(total_tokens, hidden)` +
+`cu_seqlens`, all continuous-batching logic lives in a self-contained `serving/`
+package that **reuses** every position-agnostic model module (`embed`, per-block
+`attn_norm`/`mlp_norm`/`mlp`, final `norm`, `head`) and the attention weights
+verbatim — no file under `model/`, `ops/`, or `kernels/` was touched, so the
+existing single-stream benchmarks can't regress.
+- `serving/request.py` — `Request` lifecycle (WAITING→PREFILL→DECODE→FINISHED)
+  with per-request `slot` (KV-cache row) and `pos` (absolute next-write index).
+- `serving/scheduler.py` — FCFS iteration-level admission: evict finished → free
+  slot, admit waiting within `max_running` slots + a `token_budget`, always
+  admit ≥1 when idle.
+- `serving/engine.py` — `InferenceEngine`: per-slot prefill (one forward each)
+  then ONE **ragged decode** over all DECODE requests. The engine reimplements
+  only the attention math in PyTorch — per-row RoPE via `rope_freqs.cos[pos]`,
+  per-(slot,pos) KV scatter into a reused `KVCache`, and masked SDPA with a
+  per-row length mask + `enable_gqa` — because attention is the sole
+  position/history-dependent op. KV cache is addressed by **slot** (one row per
+  running request), the contiguous-cache analogue of vLLM's block table.
+- `serving/test_engine.py` — proves the real invariant: each request's greedy
+  output is byte-identical SOLO vs CONCURRENT vs slot-reuse-limited (catches KV
+  slot bleed / mask / position bugs), and the first token matches the proven
+  `forward`+`decode_step` path. **All 4 prompts pass with full 24/24-token
+  prefix match vs the Triton reference.**
+- Run: `USE_CUDA_GRAPHS=false uv run python -m serving.test_engine`
+- *Deferred to keep it simple:* batched (multi-request) prefill and the
+  throughput benchmark workload #6 — the correctness foundation is in place.
 
 ---
 
