@@ -91,14 +91,15 @@ def reference_greedy(model: LlamaModel, prompt_ids: list[int], max_new: int, max
     return out
 
 
-def engine_outputs(model, prompt_id_lists, max_running, max_seq) -> dict[int, list[int]]:
+def engine_outputs(model, prompt_id_lists, max_running, max_seq, use_cuda_graphs=False) -> dict[int, list[int]]:
     """Run all prompts through one engine; return {prompt_index: token_ids}."""
     engine = InferenceEngine(
         model=model,
         max_running=max_running,
         max_seq_len=max_seq,
         temperature=0.0,  # greedy → deterministic
-        warmup=False,     # correctness test: keep construction state pristine
+        warmup=use_cuda_graphs,  # graphs must be captured before use
+        use_cuda_graphs=use_cuda_graphs,
     )
     reqs = []
     for ids in prompt_id_lists:
@@ -133,6 +134,11 @@ def main() -> None:
     print("Engine: concurrent-limited (max_running=2 → queueing + slot reuse)...")
     limited = engine_outputs(model, prompt_ids, max_running=2, max_seq=max_seq)
 
+    print("Engine: cuda-graphs (max_running=len(prompts), batched decode replay)...")
+    graphed = engine_outputs(
+        model, prompt_ids, max_running=len(PROMPTS), max_seq=max_seq, use_cuda_graphs=True
+    )
+
     print("Engine: warmed (warmup=True → must leave pristine state)...")
     warm_engine = InferenceEngine(
         model=model, max_running=len(PROMPTS), max_seq_len=max_seq,
@@ -145,9 +151,10 @@ def main() -> None:
     # ── checks ────────────────────────────────────────────────────────────
     failures = 0
     for i, p in enumerate(PROMPTS):
-        ref, so, co, li, wa = reference[i], solo[i], concurrent[i], limited[i], warmed[i]
+        ref, so, co, li, wa, gr = reference[i], solo[i], concurrent[i], limited[i], warmed[i], graphed[i]
 
         inv_ok = (so == co == li == wa)
+        graph_ok = (gr == co)
         first_ok = (so[0] == ref[0])
         # how far the engine's solo greedy matches the reference path
         pref = 0
@@ -156,12 +163,13 @@ def main() -> None:
                 break
             pref += 1
 
-        status = "OK" if (inv_ok and first_ok) else "FAIL"
-        if not (inv_ok and first_ok):
+        status = "OK" if (inv_ok and first_ok and graph_ok) else "FAIL"
+        if not (inv_ok and first_ok and graph_ok):
             failures += 1
 
         print(f"\n[{status}] prompt {i}: {p!r}")
         print(f"   batch-invariant (solo==concurrent==limited==warmed): {inv_ok}")
+        print(f"   cuda-graph decode == eager concurrent:               {graph_ok}")
         print(f"   first-token matches reference:                       {first_ok}")
         print(f"   reference prefix match:                              {pref}/{len(so)} tokens")
         print(f"   engine text: {tok.decode(so, skip_special=True)!r}")
@@ -170,6 +178,9 @@ def main() -> None:
             print(f"     concurrent: {co}")
             print(f"     limited:    {li}")
             print(f"     warmed:     {wa}")
+        if not graph_ok:
+            print(f"     concurrent: {co}")
+            print(f"     graphed:    {gr}")
 
     print("\n" + "=" * 60)
     if failures == 0:
