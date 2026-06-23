@@ -46,19 +46,40 @@ mask) rather than the custom Triton kernels: SDPA trivially supports the padded
 prefill and per-row ragged decode masks this engine needs, and keeps the serving
 path simple and robust. The custom Triton/CUDA-graph kernels remain the path for
 the single-stream `generate()` engine.
+
+Optional CUDA graphs for decode (Section 19)
+--------------------------------------------
+When `use_cuda_graphs` is set, the *decode* step is captured into per-batch-size
+CUDA graphs (BatchedGraphDecoder in model/cuda_graph.py — the same module as the
+single-stream decode graph) and replayed, collapsing the ~300 per-token kernel
+launches into one replay — the main win for memory-bound
+decode where the CPU, not the GPU, is the bottleneck. Capture needs fixed shapes,
+so the ragged batch is bucketed to preset sizes (1, 2, 4, … max_running), padded
+rows use a reserved scratch KV slot, and attention reads the full cache length
+under a mask. Prefill stays eager (its token count varies every call). With the
+flag off, decode runs the eager ragged SDPA path described above.
 """
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
+from model.cuda_graph import BatchedGraphDecoder
 from model.kv_cache import KVCache
 from model.llama import LlamaModel
 from ops.rope import rotate_half
 from sampling import sample
 from serving.request import Request, RequestState
 from serving.scheduler import Scheduler
+
+# Capture the batched decode step into per-batch-size CUDA graphs and replay
+# them, collapsing the ~300 per-token kernel launches into one replay (the main
+# driver of memory-bound decode's CPU overhead). Prefill stays eager. Defaults
+# off; toggle with the same USE_CUDA_GRAPHS env var the single-stream path uses.
+USE_CUDA_GRAPHS = os.environ.get("USE_CUDA_GRAPHS", "false").lower() in ("1", "true", "yes", "on")
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -78,6 +99,7 @@ class InferenceEngine:
         top_k: int = 0,
         top_p: float = 1.0,
         warmup: bool = True,
+        use_cuda_graphs: bool | None = None,
     ):
         """
         Args:
@@ -90,6 +112,9 @@ class InferenceEngine:
             temperature/top_k/top_p: sampling knobs (temperature=0 → greedy).
             warmup:       run a dummy prefill+decode at construction to prime
                           kernels/allocator so the first real request is fast.
+            use_cuda_graphs: capture the batched decode into per-batch-size CUDA
+                          graphs and replay them (eager prefill unchanged).
+                          Defaults to the USE_CUDA_GRAPHS env var.
         """
         self.model = model
         self.cfg = model.cfg
@@ -102,6 +127,7 @@ class InferenceEngine:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.use_cuda_graphs = USE_CUDA_GRAPHS if use_cuda_graphs is None else use_cuda_graphs
 
         self.n_heads_q = self.cfg.num_attention_heads
         self.n_heads_kv = self.cfg.num_key_value_heads
@@ -112,15 +138,34 @@ class InferenceEngine:
         self.scheduler = Scheduler(max_running=max_running, token_budget=budget)
 
         # One KV-cache row per slot. Reuses the Section-11 cache verbatim; we just
-        # index it by slot instead of by "current sequence position".
+        # index it by slot instead of by "current sequence position". With CUDA
+        # graphs on, one EXTRA row (index max_running) is reserved as a scratch
+        # slot for padding rows so they never touch a real request's KV.
         self.kv = KVCache(
             n_layers=self.cfg.num_hidden_layers,
-            max_batch=max_running,
+            max_batch=max_running + (1 if self.use_cuda_graphs else 0),
             max_seq_len=max_seq_len,
             n_heads_kv=self.n_heads_kv,
             head_dim=self.head_dim,
             dtype=self.dtype,
             device=self.device,
+        )
+
+        # Lazily-captured per-batch-size decode graphs (captured on first use of
+        # each bucket, or all at once in warmup()). None when graphs are off.
+        # Takes primitives — not `self` — so model/ stays free of serving/ imports.
+        self.graph_decoder = (
+            BatchedGraphDecoder(
+                model,
+                self.kv,
+                max_running=max_running,
+                n_heads_q=self.n_heads_q,
+                n_heads_kv=self.n_heads_kv,
+                head_dim=self.head_dim,
+                kv_groups=self.kv_groups,
+            )
+            if self.use_cuda_graphs
+            else None
         )
 
         if warmup:
@@ -166,10 +211,12 @@ class InferenceEngine:
         compilation/autotuning (RMSNorm, MLP), SDPA backend selection, and CUDA
         caching-allocator growth. Engine state is fully reset afterwards.
 
-        Note: the engine's ragged decode uses SDPA (not the model's captured CUDA
-        graph) by design — CUDA-graph capture needs fixed shapes, which a
-        variable batch composition violates. Warmup therefore precompiles/primes
-        those kernels rather than capturing a graph.
+        When CUDA graphs are enabled, every per-batch-size decode graph is also
+        captured here (after the eager warmup primes/autotunes the kernels) so
+        the serving loop only ever *replays* and never pays capture cost mid-
+        flight. With graphs off, the ragged decode runs eager SDPA — which is
+        what lets a variable batch composition work at all, since graph capture
+        needs fixed shapes (hence the bucketing in model/cuda_graph.py).
         """
         num_seqs = max(1, min(num_seqs, self.max_running))
         prompt_len = max(1, min(prompt_len, self.max_seq_len - decode_steps - 1))
@@ -181,6 +228,20 @@ class InferenceEngine:
         while self.has_work() and iters < max_iters:
             self.step()
             iters += 1
+        if self.graph_decoder is not None:
+            try:
+                self.graph_decoder.capture_all()
+            except Exception as e:  # noqa: BLE001 — capture is fragile; degrade safely
+                # CUDA-graph capture is driver/arch/memory-dependent and can fail
+                # (e.g. capture-unsafe op, OOM on the static buffers). A failure
+                # here must NOT kill the engine: drop the graph decoder so every
+                # decode runs the eager ragged-SDPA path instead.
+                print(
+                    f"[engine] CUDA-graph capture failed ({type(e).__name__}: {e}); "
+                    f"falling back to eager decode."
+                )
+                self.graph_decoder = None
+                self.use_cuda_graphs = False
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
         self.reset()
@@ -312,6 +373,48 @@ class InferenceEngine:
     # ── decode (ragged batch) ─────────────────────────────────────────────
 
     def _decode_batch(self, reqs: list[Request]) -> list[int]:
+        """
+        One decode step over the steady-state requests. Computes next-token
+        logits either by replaying a captured CUDA graph (when enabled and the
+        batch fits a bucket) or via the eager ragged-SDPA path, then samples and
+        advances each request. Both paths write the new K/V into the cache and
+        produce identical logits — the graph just reads the full cache length
+        under a mask instead of a dynamic `[:Lmax]` slice.
+        """
+        logits = None
+        if self.graph_decoder is not None:
+            slots = [r.slot for r in reqs]
+            positions = [r.pos for r in reqs]
+            last_tokens = [r.last_token for r in reqs]
+            try:
+                # None when the batch is larger than the biggest captured bucket.
+                logits = self.graph_decoder.logits(slots, positions, last_tokens)
+            except Exception as e:  # noqa: BLE001 — never crash a live request
+                # A lazy capture (warmup=False) or replay can still fail at
+                # runtime; permanently drop to eager rather than drop the request.
+                print(
+                    f"[engine] CUDA-graph decode failed ({type(e).__name__}: {e}); "
+                    f"falling back to eager decode."
+                )
+                self.graph_decoder = None
+                self.use_cuda_graphs = False
+                logits = None
+        if logits is None:
+            logits = self._decode_logits_eager(reqs)
+
+        toks = self._sample(logits).tolist()
+        for req, tok in zip(reqs, toks):
+            req.generated.append(tok)
+            req.pos += 1
+            if tok == self.eos_id:
+                req.eos_hit = True
+            if req.should_finish():
+                req.state = RequestState.FINISHED
+        return toks
+
+    def _decode_logits_eager(self, reqs: list[Request]) -> torch.Tensor:
+        """Eager ragged decode: write each row's new K/V, attend over its own
+        valid prefix with a per-row length mask, return logits (R, vocab)."""
         R = len(reqs)
         slots = torch.tensor([r.slot for r in reqs], dtype=torch.long, device=self.device)
         positions = torch.tensor([r.pos for r in reqs], dtype=torch.long, device=self.device)
@@ -333,17 +436,7 @@ class InferenceEngine:
             h = h + layer.mlp(layer.mlp_norm(h))
 
         h = self.model.norm(h)
-        logits = self.model.head(h)[:, -1, :]        # (R, vocab)
-        toks = self._sample(logits).tolist()
-
-        for req, tok in zip(reqs, toks):
-            req.generated.append(tok)
-            req.pos += 1
-            if tok == self.eos_id:
-                req.eos_hit = True
-            if req.should_finish():
-                req.state = RequestState.FINISHED
-        return toks
+        return self.model.head(h)[:, -1, :]          # (R, vocab)
 
     def _attn_decode(self, h, layer, slots, positions, Lmax, cos, sin, mask, R) -> torch.Tensor:
         attn = layer.attn
