@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
@@ -48,11 +49,13 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from torch.profiler import record_function
 
 from config import ModelConfig
 from loader import WeightLoader
 from model.llama import LlamaModel
 from serving.engine import InferenceEngine
+from serving.profiler import ServerProfiler
 from serving.request import Request, RequestState
 from tokenizer import Tokenizer
 
@@ -93,17 +96,33 @@ class _Worker:
 
     def __init__(self, engine: InferenceEngine):
         self.engine = engine
+        self.profiler = ServerProfiler(engine)
         self.submit_q: "queue.Queue[_Job]" = queue.Queue()
         self.tracked: dict[int, _Job] = {}   # req_id -> job (worker-thread only)
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="engine-worker", daemon=True)
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="engine-worker",
+        )
+        self._future: Optional[Future] = None
 
     def start(self) -> None:
-        self._thread.start()
+        if self._future is not None:
+            raise RuntimeError("engine worker already started")
+        self._future = self._executor.submit(self._loop)
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=10)
+        if self._future is None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            return
+        try:
+            self._future.result(timeout=10)
+        except TimeoutError:
+            print("[server] engine worker did not stop within 10 seconds")
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            self._executor.shutdown(wait=True)
 
     def submit(self, job: _Job) -> None:
         self.submit_q.put(job)
@@ -130,33 +149,42 @@ class _Worker:
                 return
 
     def _loop(self) -> None:
-        while not self._stop.is_set():
-            idle = not self.engine.has_work() and not self.tracked
-            # When idle, block briefly for the first job; otherwise drain quickly.
-            self._drain_submissions(block=idle)
-            if not self.engine.has_work():
-                continue
+        self.profiler.start()
+        try:
+            while not self._stop.is_set():
+                idle = not self.engine.has_work() and not self.tracked
+                # When idle, block briefly for the first job; otherwise drain quickly.
+                with record_function("server.admit_submissions"):
+                    self._drain_submissions(block=idle)
+                if not self.engine.has_work():
+                    continue
 
-            try:
-                emitted = self.engine.step()
-            except Exception as e:  # a forward-pass failure dooms the whole batch
-                for job in self.tracked.values():
-                    job.out.put((ERROR, f"engine step failed: {e}"))
-                self.tracked.clear()
-                self.engine.reset()
-                continue
+                try:
+                    self.profiler.before_step()
+                    with record_function("server.engine_step"):
+                        emitted = self.engine.step()
+                except Exception as e:  # a forward-pass failure dooms the whole batch
+                    for job in self.tracked.values():
+                        job.out.put((ERROR, f"engine step failed: {e}"))
+                    self.tracked.clear()
+                    self.engine.reset()
+                    continue
 
-            for req_id, tok in emitted.items():
-                job = self.tracked.get(req_id)
-                if job is not None:
-                    job.out.put((TOKEN, tok))
+                with record_function("server.dispatch_outputs"):
+                    for req_id, tok in emitted.items():
+                        job = self.tracked.get(req_id)
+                        if job is not None:
+                            job.out.put((TOKEN, tok))
 
-            # Retire finished requests (state set inside engine.step()).
-            for req_id, job in list(self.tracked.items()):
-                if job.req is not None and job.req.state is RequestState.FINISHED:
-                    reason = "stop" if job.req.eos_hit else "length"
-                    job.out.put((DONE, reason))
-                    self.tracked.pop(req_id)
+                    # Retire finished requests (state set inside engine.step()).
+                    for req_id, job in list(self.tracked.items()):
+                        if job.req is not None and job.req.state is RequestState.FINISHED:
+                            reason = "stop" if job.req.eos_hit else "length"
+                            job.out.put((DONE, reason))
+                            self.tracked.pop(req_id)
+                self.profiler.step()
+        finally:
+            self.profiler.stop()
 
 
 # ── shared server state ─────────────────────────────────────────────────────
