@@ -4,6 +4,13 @@ Where `profile-kernels/` isolates a single Triton kernel, this folder profiles
 the **whole generation engine** end to end: token embedding, all 28 transformer
 blocks (attention + RMSNorm + RoPE + SwiGLU MLP), the LM head, and sampling.
 
+There are now two engine profiling paths:
+
+- `profile_engine_torch.py` profiles the fixed iteration-03 benchmark loop.
+- `SERVE_PROFILE=true` profiles the live FastAPI worker, including queue
+  admission, scheduling, continuous-batching prefill/decode, sampling, and
+  output dispatch under real HTTP traffic.
+
 ## Engine parity
 
 `torch-profiler/profile_engine_torch.py` runs a `prefill_and_decode` function
@@ -51,6 +58,41 @@ uv run python profiling/profile-engine/torch-profiler/profile_engine_torch.py --
 The backend (Triton fused kernels vs PyTorch reference) follows `USE_TRITON` in
 `.env`.
 
+## Profile the live server
+
+Start one server process with profiling enabled:
+
+```bash
+SERVE_PROFILE=true \
+SERVE_PROFILE_DELAY_STEPS=32 \
+SERVE_PROFILE_WAIT=1 \
+SERVE_PROFILE_WARMUP=1 \
+SERVE_PROFILE_ACTIVE=10 \
+USE_CUDA_GRAPHS=true \
+uv run uvicorn serving.server:app --host 127.0.0.1 --port 8000
+```
+
+`SERVE_PROFILE_DELAY_STEPS` executes real engine work before the profiler
+starts. Send the same workload once to autotune its exact prefill/decode shapes,
+then again to capture it. A 32-token warmup workload consumes 32 engine steps,
+so the second workload starts the profiler with the relevant Triton configs
+already selected and CUDA decode graphs already captured during engine startup.
+
+```bash
+curl -s http://127.0.0.1:8000/generate \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Explain grouped-query attention simply.","max_new_tokens":32}'
+```
+
+The capture is written once to:
+
+- `torch-profiler/out/profiler_server_engine.txt`
+- `torch-profiler/out/server_engine_trace.json`
+
+The server keeps running after the capture completes. The trace covers the
+actual GPU-owning worker thread; FastAPI socket/parsing time remains visible
+through end-to-end client latency rather than as PyTorch operators.
+
 ## Output convention (clean format)
 
 All engine output goes to `torch-profiler/out/` — one tidy report per flavor and
@@ -61,6 +103,8 @@ as the kernel reports:
 |------|----------|
 | `out/profiler_engine_<flavor>.txt` | banner + summary block (prompt/new tokens, prefill ms, decode ms/step, peak VRAM, sampling) + `key_averages` op table sorted by `cuda_time_total` |
 | `out/engine_<flavor>_trace.json` | Chrome/Perfetto timeline (open at `chrome://tracing` or `ui.perfetto.dev`) |
+| `out/server_operation_breakdown.html` | self-contained CPU/GPU operation charts for the live-server baseline |
+| `out/server_cuda_graph_comparison.html` | graph-off vs graph-on request-time, operation, latency, and launch-count charts |
 | `tensorboard-profiler/logdir/<flavor>/*.pt.trace.json` | TensorBoard PyTorch Profiler trace (written by `tensorboard_trace_handler`) |
 
 TensorBoard output is on by default; pass `--no-tensorboard` to skip it.
