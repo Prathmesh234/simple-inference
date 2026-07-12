@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Server Decode: CUDA Graph Comparison</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b12;
+      --panel: #111723;
+      --panel-2: #171f2e;
+      --line: #283349;
+      --text: #f4f7fb;
+      --muted: #9aa8bc;
+      --off: #ffb454;
+      --on: #4fd1a5;
+      --accent: #8ba7ff;
+      --warn: #ff7b89;
+      --shadow: 0 18px 52px rgb(0 0 0 / 28%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% -8%, rgb(139 167 255 / 20%), transparent 34rem),
+        radial-gradient(circle at 100% 0%, rgb(79 209 165 / 12%), transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1440px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 52px 0 72px;
+    }
+
+    h1, h2, p { margin-top: 0; }
+    h1 {
+      max-width: 1020px;
+      margin-bottom: 12px;
+      font-size: clamp(34px, 5vw, 58px);
+      line-height: 1.02;
+      letter-spacing: -.035em;
+    }
+    h2 { margin-bottom: 6px; font-size: 21px; }
+
+    .eyebrow {
+      margin-bottom: 14px;
+      color: var(--on);
+      font-size: 12px;
+      font-weight: 760;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      max-width: 940px;
+      margin-bottom: 24px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .notice {
+      margin-bottom: 26px;
+      border: 1px solid rgb(255 123 137 / 42%);
+      border-left: 4px solid var(--warn);
+      border-radius: 12px;
+      background: rgb(255 123 137 / 7%);
+      padding: 12px 15px;
+      color: #d9c7cb;
+    }
+
+    .notice b { color: #ffd9dd; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 30px;
+    }
+
+    .card, .panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(145deg, rgb(23 31 46 / 96%), rgb(13 18 29 / 96%));
+      box-shadow: var(--shadow);
+    }
+
+    .card { min-height: 126px; padding: 19px; }
+    .card .value {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 31px;
+      font-weight: 770;
+      letter-spacing: -.03em;
+    }
+    .card .label { color: var(--muted); font-size: 12px; }
+    .card .detail { margin-top: 10px; color: #c5cfdd; font-size: 12px; }
+    .good { color: var(--on); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .panel {
+      min-width: 0;
+      margin-bottom: 18px;
+      padding: 22px;
+      overflow: hidden;
+    }
+
+    .panel.wide { grid-column: 1 / -1; }
+    .panel-copy { margin-bottom: 16px; color: var(--muted); font-size: 12px; }
+    .chart { width: 100%; min-height: 390px; }
+    .chart.large { min-height: 640px; }
+    .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 11px; height: 11px; border-radius: 3px; }
+
+    .takeaways {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .takeaway {
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      background: rgb(139 167 255 / 7%);
+      padding: 13px 14px;
+      color: #cbd5e4;
+    }
+    .takeaway b { display: block; margin-bottom: 4px; color: var(--text); }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 11px 10px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr:hover { background: rgb(139 167 255 / 6%); }
+    .off-text { color: var(--off); }
+    .on-text { color: var(--on); }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgb(16 22 34 / 72%);
+      padding: 15px 17px;
+      color: var(--muted);
+    }
+    summary { color: var(--text); cursor: pointer; font-weight: 700; }
+    details ul { margin-bottom: 0; padding-left: 20px; }
+    code { color: #c5b8ff; }
+
+    .tick-label, .axis-label, .row-label, .value-label, .point-label {
+      font-family: inherit;
+      pointer-events: none;
+    }
+    .tick-label { fill: #8190a6; font-size: 11px; }
+    .axis-label { fill: #aab6c8; font-size: 12px; font-weight: 650; }
+    .row-label { fill: #dfe6f1; font-size: 12px; }
+    .value-label { fill: #edf2f8; font-size: 10px; font-weight: 700; }
+    .point-label { fill: #dce4ef; font-size: 11px; font-weight: 650; }
+    .grid-line { stroke: #273247; stroke-width: 1; }
+    .axis-line { stroke: #536077; stroke-width: 1; }
+
+    @media (max-width: 1050px) {
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
+      .panel.wide { grid-column: auto; }
+    }
+
+    @media (max-width: 660px) {
+      main { width: min(100% - 24px, 1440px); padding-top: 32px; }
+      .cards, .takeaways { grid-template-columns: 1fr; }
+      .panel { padding: 16px; }
+      .chart { overflow-x: auto; }
+      .chart svg { min-width: 780px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Live server decode / before and after CUDA graphs</div>
+  <h1>Graph replay cuts decode latency while exposing buffer staging as the next bottleneck</h1>
+  <p class="subtitle">
+    Comparison of the dominant clean decode groups in the saved graph-off and graph-on
+    server traces. Operation values are normalized per request-forward.
+  </p>
+
+  <div class="notice">
+    <b>Important comparison note:</b> the graph-off capture stabilized at batch 4,
+    while graph-on stabilized at batch 8. Per-request normalization makes the observed
+    runs easier to compare, but this is not a controlled same-batch causal benchmark.
+  </div>
+
+  <section class="cards" aria-label="CUDA graph comparison summary">
+    <article class="card">
+      <span class="value good">4.39x</span>
+      <span class="label">lower amortized decode time</span>
+      <div class="detail">13.68 ms to 3.12 ms per request-forward</div>
+    </article>
+    <article class="card">
+      <span class="value good">2.19x</span>
+      <span class="label">lower batch-step wall time</span>
+      <div class="detail">54.72 ms at B=4 to 24.96 ms at B=8</div>
+    </article>
+    <article class="card">
+      <span class="value good">4.39x</span>
+      <span class="label">higher observed throughput</span>
+      <div class="detail">73.1 to 320.6 generated tokens/second</div>
+    </article>
+    <article class="card">
+      <span class="value good">92.8%</span>
+      <span class="label">fewer individual kernel launches</span>
+      <div class="detail">846 to 61 launches per decode batch</div>
+    </article>
+  </section>
+
+  <section class="grid">
+    <article class="panel wide">
+      <h2>Total request-forward time versus operation cost</h2>
+      <p class="panel-copy">
+        CPU milliseconds per request-forward. Operator rows can be nested and are not
+        additive; zero after graphing means the work executes inside replay and is no
+        longer visible as a separate host operator range.
+      </p>
+      <div id="operation-chart" class="chart large" role="img"
+        aria-label="Graph off versus graph on request and operation time chart"></div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--off)"></i>CUDA graphs off (B=4)</span>
+        <span><i class="swatch" style="background:var(--on)"></i>CUDA graphs on (B=8)</span>
+      </div>
+    </article>
+
+    <article class="panel">
+      <h2>Decode-step latency distribution</h2>
+      <p class="panel-copy">Six clean decode steps from each dominant batch-size group.</p>
+      <div id="latency-chart" class="chart" role="img"
+        aria-label="Decode step latency distribution chart"></div>
+    </article>
+
+    <article class="panel">
+      <h2>Launches per decode batch</h2>
+      <p class="panel-copy">Individual CUDA kernel launches collapse into one graph replay.</p>
+      <div id="launch-chart" class="chart" role="img"
+        aria-label="Kernel launch count comparison chart"></div>
+    </article>
+
+    <article class="panel wide">
+      <h2>What changed</h2>
+      <div class="takeaways">
+        <div class="takeaway">
+          <b>Per-op Python and ATen dispatch largely disappears.</b>
+          Linear, RoPE, residual, and KV-write ranges move inside the captured graph.
+        </div>
+        <div class="takeaway">
+          <b>Static-buffer staging is now dominant.</b>
+          Tensor copies account for 2.60 ms of the 3.12 ms graph-on request-forward cost.
+        </div>
+        <div class="takeaway">
+          <b>Sampling remains outside the graph.</b>
+          Sort, top-k, softmax, and multinomial still execute once per decode batch.
+        </div>
+      </div>
+    </article>
+  </section>
+
+  <section class="panel">
+    <h2>Exact normalized measurements</h2>
+    <p class="panel-copy">Derived from the clean decode spans in the saved Chrome traces.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Measurement</th>
+            <th>Graphs off</th>
+            <th>Graphs on</th>
+            <th>Change</th>
+          </tr>
+        </thead>
+        <tbody id="comparison-table"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <details>
+    <summary>Method and limitations</summary>
+    <ul>
+      <li>Source traces: <code>server_engine_trace_graph_off.json</code> and <code>server_engine_trace_graph_on.json</code>.</li>
+      <li>The dominant clean groups contain six graph-off B=4 decode steps and six graph-on B=8 decode steps.</li>
+      <li>Request-forward time is decode-batch wall time divided by active batch size.</li>
+      <li>Throughput is active batch size divided by mean decode-step wall time.</li>
+      <li>CPU operation time is summed inside the selected <code>engine.decode_batch</code> spans and divided by request-forwards.</li>
+      <li>ATen ranges are nested. Operation rows explain where time appears but must not be summed into the total row.</li>
+      <li>Use <code>benchmarks/bench_engine_cudagraph.py</code> for a controlled same-batch benchmark.</li>
+    </ul>
+  </details>
+</main>
+
+<script>
+  const colors = { off: "#ffb454", on: "#4fd1a5" };
+  const runs = {
+    off: {
+      label: "Graphs off",
+      batch: 4,
+      steps: [59.084, 52.568, 53.090, 56.644, 53.496, 53.443],
+      requestTime: 13.680198,
+      throughput: 73.098,
+      individualLaunches: 846,
+      graphLaunches: 0
+    },
+    on: {
+      label: "Graphs on",
+      batch: 8,
+      steps: [27.706, 24.005, 23.619, 24.016, 23.646, 26.742],
+      requestTime: 3.119466,
+      throughput: 320.568,
+      individualLaunches: 61,
+      graphLaunches: 1
+    }
+  };
+
+  const operationRows = [
+    { name: "Total decode request-forward", off: 13.680198, on: 3.119466, total: true },
+    { name: "Linear projections", off: 2.996400, on: 0 },
+    { name: "Tensor / static-buffer copies", off: 0.060690, on: 2.599430 },
+    { name: "Individual kernel launch APIs", off: 1.847800, on: 0.047580 },
+    { name: "CUDA graph launch API", off: 0, on: 0.245660 },
+    { name: "Elementwise multiply", off: 0.579000, on: 0 },
+    { name: "KV cache scatter", off: 0.564540, on: 0 },
+    { name: "Residual / elementwise add", off: 0.509800, on: 0 },
+    { name: "KV cache gather", off: 0.457710, on: 0.010090 },
+    { name: "RoPE concatenation", off: 0.314000, on: 0 },
+    { name: "Sampling multinomial", off: 0.106130, on: 0.042320 },
+    { name: "Sampling sort", off: 0.104990, on: 0.045060 },
+    { name: "Sampling top-k", off: 0.043520, on: 0.019450 }
+  ];
+
+  const NS = "http://www.w3.org/2000/svg";
+
+  function svgNode(tag, attributes = {}, text = "") {
+    const node = document.createElementNS(NS, tag);
+    Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, value));
+    if (text) node.textContent = text;
+    return node;
+  }
+
+  function addTitle(node, text) {
+    node.appendChild(svgNode("title", {}, text));
+  }
+
+  function mean(values) {
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+
+  function renderOperationChart() {
+    const target = document.getElementById("operation-chart");
+    const width = 1160;
+    const margin = { top: 18, right: 80, bottom: 54, left: 250 };
+    const rowHeight = 43;
+    const height = margin.top + margin.bottom + operationRows.length * rowHeight;
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = operationRows.length * rowHeight;
+    const max = 14;
+    const svg = svgNode("svg", { viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true" });
+
+    for (let tick = 0; tick <= 7; tick += 1) {
+      const value = max * tick / 7;
+      const x = margin.left + plotWidth * tick / 7;
+      svg.appendChild(svgNode("line", {
+        x1: x, y1: margin.top, x2: x, y2: margin.top + plotHeight, class: "grid-line"
+      }));
+      svg.appendChild(svgNode("text", {
+        x, y: margin.top + plotHeight + 24, "text-anchor": "middle", class: "tick-label"
+      }, value.toFixed(0)));
+    }
+
+    operationRows.forEach((row, index) => {
+      const y = margin.top + index * rowHeight + 5;
+      const offWidth = plotWidth * row.off / max;
+      const onWidth = plotWidth * row.on / max;
+      svg.appendChild(svgNode("text", {
+        x: margin.left - 14, y: y + 17, "text-anchor": "end",
+        class: "row-label", "font-weight": row.total ? "750" : "500"
+      }, row.name));
+
+      const offBar = svgNode("rect", {
+        x: margin.left, y, width: Math.max(offWidth, row.off ? 2 : 0),
+        height: 13, rx: 4, fill: colors.off, opacity: row.total ? "1" : ".84"
+      });
+      addTitle(offBar, `${row.name} - graphs off: ${row.off.toFixed(4)} ms/request-forward`);
+      svg.appendChild(offBar);
+
+      const onBar = svgNode("rect", {
+        x: margin.left, y: y + 17, width: Math.max(onWidth, row.on ? 2 : 0),
+        height: 13, rx: 4, fill: colors.on, opacity: row.total ? "1" : ".84"
+      });
+      addTitle(onBar, `${row.name} - graphs on: ${row.on.toFixed(4)} ms/request-forward`);
+      svg.appendChild(onBar);
+
+      if (row.off) {
+        svg.appendChild(svgNode("text", {
+          x: margin.left + Math.min(offWidth + 7, plotWidth - 3),
+          y: y + 10,
+          "text-anchor": offWidth > plotWidth - 70 ? "end" : "start",
+          class: "value-label"
+        }, row.off.toFixed(row.off >= 1 ? 2 : 3)));
+      }
+      if (row.on) {
+        svg.appendChild(svgNode("text", {
+          x: margin.left + Math.min(onWidth + 7, plotWidth - 3),
+          y: y + 27,
+          "text-anchor": onWidth > plotWidth - 70 ? "end" : "start",
+          class: "value-label"
+        }, row.on.toFixed(row.on >= 1 ? 2 : 3)));
+      }
+    });
+
+    svg.appendChild(svgNode("line", {
+      x1: margin.left, y1: margin.top + plotHeight,
+      x2: margin.left + plotWidth, y2: margin.top + plotHeight, class: "axis-line"
+    }));
+    svg.appendChild(svgNode("text", {
+      x: margin.left + plotWidth / 2, y: height - 7,
+      "text-anchor": "middle", class: "axis-label"
+    }, "CPU milliseconds per request-forward"));
+    target.replaceChildren(svg);
+  }
+
+  function renderLatencyChart() {
+    const target = document.getElementById("latency-chart");
+    const width = 720;
+    const height = 430;
+    const margin = { top: 24, right: 40, bottom: 68, left: 68 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const max = 65;
+    const svg = svgNode("svg", { viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true" });
+
+    for (let tick = 0; tick <= 6; tick += 1) {
+      const value = max * tick / 6;
+      const y = margin.top + plotHeight - plotHeight * tick / 6;
+      svg.appendChild(svgNode("line", {
+        x1: margin.left, y1: y, x2: margin.left + plotWidth, y2: y, class: "grid-line"
+      }));
+      svg.appendChild(svgNode("text", {
+        x: margin.left - 10, y: y + 4, "text-anchor": "end", class: "tick-label"
+      }, value.toFixed(0)));
+    }
+
+    [["off", width * .34], ["on", width * .70]].forEach(([key, center]) => {
+      const run = runs[key];
+      run.steps.forEach((value, index) => {
+        const jitter = (index - (run.steps.length - 1) / 2) * 12;
+        const y = margin.top + plotHeight - value / max * plotHeight;
+        const point = svgNode("circle", {
+          cx: center + jitter, cy: y, r: 7, fill: colors[key],
+          "fill-opacity": ".75", stroke: "#f2f6fb", "stroke-width": "1"
+        });
+        addTitle(point, `${run.label}: ${value.toFixed(3)} ms`);
+        svg.appendChild(point);
+      });
+      const avg = mean(run.steps);
+      const meanY = margin.top + plotHeight - avg / max * plotHeight;
+      svg.appendChild(svgNode("line", {
+        x1: center - 58, y1: meanY, x2: center + 58, y2: meanY,
+        stroke: colors[key], "stroke-width": "4", "stroke-linecap": "round"
+      }));
+      svg.appendChild(svgNode("text", {
+        x: center, y: meanY - 10, "text-anchor": "middle", class: "point-label"
+      }, `mean ${avg.toFixed(2)} ms`));
+      svg.appendChild(svgNode("text", {
+        x: center, y: margin.top + plotHeight + 29,
+        "text-anchor": "middle", class: "axis-label"
+      }, `${run.label} (B=${run.batch})`));
+    });
+
+    svg.appendChild(svgNode("text", {
+      x: 16, y: margin.top + plotHeight / 2, "text-anchor": "middle",
+      transform: `rotate(-90 16 ${margin.top + plotHeight / 2})`, class: "axis-label"
+    }, "decode batch wall time (ms)"));
+    target.replaceChildren(svg);
+  }
+
+  function renderLaunchChart() {
+    const target = document.getElementById("launch-chart");
+    const width = 720;
+    const height = 430;
+    const margin = { top: 28, right: 36, bottom: 74, left: 70 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const max = 900;
+    const svg = svgNode("svg", { viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true" });
+
+    for (let tick = 0; tick <= 6; tick += 1) {
+      const value = max * tick / 6;
+      const y = margin.top + plotHeight - plotHeight * tick / 6;
+      svg.appendChild(svgNode("line", {
+        x1: margin.left, y1: y, x2: margin.left + plotWidth, y2: y, class: "grid-line"
+      }));
+      svg.appendChild(svgNode("text", {
+        x: margin.left - 10, y: y + 4, "text-anchor": "end", class: "tick-label"
+      }, value.toFixed(0)));
+    }
+
+    const groups = [
+      { key: "off", x: margin.left + plotWidth * .30 },
+      { key: "on", x: margin.left + plotWidth * .70 }
+    ];
+    groups.forEach(group => {
+      const run = runs[group.key];
+      const barWidth = 78;
+      const individualHeight = plotHeight * run.individualLaunches / max;
+      const graphHeight = plotHeight * run.graphLaunches / max;
+      svg.appendChild(svgNode("rect", {
+        x: group.x - barWidth / 2,
+        y: margin.top + plotHeight - individualHeight,
+        width: barWidth,
+        height: individualHeight,
+        rx: 6,
+        fill: colors[group.key]
+      }));
+      if (graphHeight) {
+        svg.appendChild(svgNode("rect", {
+          x: group.x - barWidth / 2,
+          y: margin.top + plotHeight - individualHeight - Math.max(graphHeight, 3),
+          width: barWidth,
+          height: Math.max(graphHeight, 3),
+          rx: 2,
+          fill: "#8ba7ff"
+        }));
+      }
+      svg.appendChild(svgNode("text", {
+        x: group.x, y: margin.top + plotHeight - individualHeight - 10,
+        "text-anchor": "middle", class: "point-label"
+      }, `${run.individualLaunches} individual${run.graphLaunches ? " + 1 graph" : ""}`));
+      svg.appendChild(svgNode("text", {
+        x: group.x, y: margin.top + plotHeight + 31,
+        "text-anchor": "middle", class: "axis-label"
+      }, run.label));
+    });
+
+    svg.appendChild(svgNode("text", {
+      x: 16, y: margin.top + plotHeight / 2, "text-anchor": "middle",
+      transform: `rotate(-90 16 ${margin.top + plotHeight / 2})`, class: "axis-label"
+    }, "launches per decode batch"));
+    target.replaceChildren(svg);
+  }
+
+  function formatChange(off, on, lowerIsBetter = true) {
+    if (!off) return "new";
+    const ratio = on / off;
+    const percent = Math.abs((ratio - 1) * 100);
+    const improved = lowerIsBetter ? ratio < 1 : ratio > 1;
+    return `<span class="${improved ? "on-text" : "off-text"}">` +
+      `${percent.toFixed(1)}% ${ratio < 1 ? "lower" : "higher"}</span>`;
+  }
+
+  function renderTable() {
+    const body = document.getElementById("comparison-table");
+    const rows = [
+      { name: "Mean decode batch wall time", off: mean(runs.off.steps), on: mean(runs.on.steps), unit: "ms", lower: true },
+      { name: "Amortized request-forward time", off: runs.off.requestTime, on: runs.on.requestTime, unit: "ms", lower: true },
+      { name: "Observed decode throughput", off: runs.off.throughput, on: runs.on.throughput, unit: "tok/s", lower: false },
+      { name: "Individual launches / batch", off: runs.off.individualLaunches, on: runs.on.individualLaunches, unit: "", lower: true },
+      { name: "Tensor copy time / request", off: 0.060690, on: 2.599430, unit: "ms", lower: true },
+      { name: "Launch API time / request", off: 1.847800, on: 0.293240, unit: "ms", lower: true }
+    ];
+    rows.forEach(row => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${row.name}</td>
+        <td class="off-text">${row.off.toFixed(row.off >= 10 ? 1 : 3)} ${row.unit}</td>
+        <td class="on-text">${row.on.toFixed(row.on >= 10 ? 1 : 3)} ${row.unit}</td>
+        <td>${formatChange(row.off, row.on, row.lower)}</td>
+      `;
+      body.appendChild(tr);
+    });
+  }
+
+  renderOperationChart();
+  renderLatencyChart();
+  renderLaunchChart();
+  renderTable();
+</script>
+</body>
+</html>
