@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Server Decode Operation Breakdown</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b12;
+      --panel: #101622;
+      --panel-2: #151d2c;
+      --line: #263247;
+      --text: #f4f7fb;
+      --muted: #9aa8bc;
+      --cpu: #ffb454;
+      --gpu: #4fd1a5;
+      --accent: #8ba7ff;
+      --danger: #ff7b89;
+      --shadow: 0 18px 50px rgb(0 0 0 / 28%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 15% -10%, rgb(77 105 180 / 22%), transparent 34rem),
+        radial-gradient(circle at 100% 0%, rgb(34 197 148 / 12%), transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1440px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 52px 0 72px;
+    }
+
+    h1, h2, p { margin-top: 0; }
+    h1 { max-width: 900px; margin-bottom: 12px; font-size: clamp(34px, 5vw, 58px); line-height: 1.02; }
+    h2 { margin-bottom: 6px; font-size: 21px; }
+
+    .eyebrow {
+      margin-bottom: 14px;
+      color: var(--gpu);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      max-width: 920px;
+      margin-bottom: 26px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 28px;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgb(16 22 34 / 78%);
+      padding: 6px 11px;
+      color: #c9d3e3;
+      font-size: 12px;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 0 0 30px;
+    }
+
+    .card, .panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(145deg, rgb(21 29 44 / 96%), rgb(13 18 29 / 96%));
+      box-shadow: var(--shadow);
+    }
+
+    .card { min-height: 122px; padding: 19px; }
+    .card .value { display: block; margin-bottom: 4px; font-size: 30px; font-weight: 760; letter-spacing: -.025em; }
+    .card .label { color: var(--muted); font-size: 12px; }
+    .card .detail { margin-top: 10px; color: #c4cedd; font-size: 12px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .panel {
+      min-width: 0;
+      margin-bottom: 18px;
+      padding: 22px;
+      overflow: hidden;
+    }
+
+    .panel.wide { grid-column: 1 / -1; }
+    .panel-copy { margin-bottom: 16px; color: var(--muted); font-size: 12px; }
+    .chart { width: 100%; min-height: 420px; }
+    .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 15px;
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+    .takeaways {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .takeaway {
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      background: rgb(139 167 255 / 7%);
+      padding: 13px 14px;
+      color: #cbd5e4;
+    }
+
+    .takeaway b { display: block; margin-bottom: 4px; color: var(--text); }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { border-bottom: 1px solid var(--line); padding: 11px 10px; text-align: right; white-space: nowrap; }
+    th { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr:hover { background: rgb(139 167 255 / 6%); }
+
+    .op-name { display: flex; align-items: center; gap: 9px; }
+    .op-dot { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; }
+    .cpu-text { color: var(--cpu); }
+    .gpu-text { color: var(--gpu); }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgb(16 22 34 / 72%);
+      padding: 15px 17px;
+      color: var(--muted);
+    }
+
+    summary { color: var(--text); cursor: pointer; font-weight: 700; }
+    details ul { margin-bottom: 0; padding-left: 20px; }
+    code { color: #c5b8ff; }
+
+    .axis-label, .tick-label, .bar-label, .bar-value, .point-label {
+      font-family: inherit;
+      pointer-events: none;
+    }
+
+    .tick-label { fill: #8190a6; font-size: 11px; }
+    .axis-label { fill: #aab6c8; font-size: 12px; font-weight: 650; }
+    .bar-label { fill: #dfe6f1; font-size: 12px; }
+    .bar-value { fill: #edf2f8; font-size: 11px; font-weight: 700; }
+    .point-label { fill: #d8e0ec; font-size: 10px; }
+    .grid-line { stroke: #273247; stroke-width: 1; }
+    .axis-line { stroke: #536077; stroke-width: 1; }
+
+    @media (max-width: 1050px) {
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
+      .panel.wide { grid-column: auto; }
+    }
+
+    @media (max-width: 660px) {
+      main { width: min(100% - 24px, 1440px); padding-top: 32px; }
+      .cards, .takeaways { grid-template-columns: 1fr; }
+      .panel { padding: 16px; }
+      .chart { min-height: 320px; overflow-x: auto; }
+      .chart svg { min-width: 760px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Live server / eager decode baseline</div>
+  <h1>Decode work is dominated by host-side attention dispatch</h1>
+  <p class="subtitle">
+    Stable batch-6 decode forwards from the live FastAPI worker. CPU and GPU use
+    separate scales below so small CUDA kernels stay visible instead of collapsing
+    into a few pixels.
+  </p>
+
+  <div class="meta">
+    <span class="pill">RTX 6000 Ada</span>
+    <span class="pill">Torch SDPA attention</span>
+    <span class="pill">CUDA graphs off</span>
+    <span class="pill">8 clean decode batches</span>
+    <span class="pill">48 request-forwards</span>
+  </div>
+
+  <section class="cards" aria-label="Profile summary">
+    <article class="card">
+      <span class="value">2.77 ms</span>
+      <span class="label">attention CPU time / request-forward</span>
+      <div class="detail">Largest measured host-side operator range</div>
+    </article>
+    <article class="card">
+      <span class="value">15.3x</span>
+      <span class="label">attention CPU-to-GPU ratio</span>
+      <div class="detail">2.772 ms host vs 0.182 ms device</div>
+    </article>
+    <article class="card">
+      <span class="value">28</span>
+      <span class="label">attention calls / batch forward</span>
+      <div class="detail">Exactly one call per transformer layer</div>
+    </article>
+    <article class="card">
+      <span class="value">6</span>
+      <span class="label">requests / measured batch</span>
+      <div class="detail">Values are amortized over concurrent requests</div>
+    </article>
+  </section>
+
+  <section class="grid">
+    <article class="panel">
+      <h2>CPU operator and launch time</h2>
+      <p class="panel-copy">Milliseconds per request-forward. Ranked independently from GPU time.</p>
+      <div id="cpu-chart" class="chart" role="img" aria-label="CPU operation time bar chart"></div>
+    </article>
+
+    <article class="panel">
+      <h2>Correlated CUDA execution</h2>
+      <p class="panel-copy">Milliseconds per request-forward. Nested ranges are not additive.</p>
+      <div id="gpu-chart" class="chart" role="img" aria-label="GPU operation time bar chart"></div>
+    </article>
+
+    <article class="panel wide">
+      <h2>Host overhead versus device work</h2>
+      <p class="panel-copy">
+        Log-log view. Bubble size represents calls per batch. Operations far below the diagonal
+        spend substantially more time on CPU dispatch than CUDA execution.
+      </p>
+      <div id="scatter-chart" class="chart" role="img" aria-label="CPU versus GPU time scatter chart"></div>
+      <div id="category-legend" class="legend"></div>
+    </article>
+
+    <article class="panel wide">
+      <h2>What the profile says</h2>
+      <div class="takeaways">
+        <div class="takeaway">
+          <b>Attention is launch-bound.</b>
+          Its host range is 15.3x longer than its correlated CUDA work.
+        </div>
+        <div class="takeaway">
+          <b>Linear projections amplify dispatch cost.</b>
+          169 projection calls per batch account for 1.93 ms CPU per request-forward.
+        </div>
+        <div class="takeaway">
+          <b>Sampling is not the bottleneck.</b>
+          Top-k, multinomial, and sampling softmax are all below 0.09 ms CPU each.
+        </div>
+      </div>
+    </article>
+  </section>
+
+  <section class="panel">
+    <h2>Exact operation data</h2>
+    <p class="panel-copy">Sorted by CPU time. Ratios compare host operator time with correlated CUDA work.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Operation</th>
+            <th>Calls</th>
+            <th>Calls / batch</th>
+            <th>CPU ms / request</th>
+            <th>GPU ms / request</th>
+            <th>CPU / GPU</th>
+          </tr>
+        </thead>
+        <tbody id="operation-table"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <details>
+    <summary>Method and interpretation notes</summary>
+    <ul>
+      <li>Decode steps 1-2 were excluded because real request shapes triggered Triton autotuning.</li>
+      <li>Steps 3-10 were stable batch-6 forwards: 8 batches and 48 request-forwards.</li>
+      <li>Displayed time is total measured time divided by 48 request-forwards. It is throughput cost, not batch-1 latency.</li>
+      <li>CPU values for ATen rows use the operator range. Triton rows use correlated <code>cudaLaunchKernel</code> host duration.</li>
+      <li>GPU values are kernels, memcpy, and memset correlated to each operation.</li>
+      <li>PyTorch operator ranges can be nested, so rows must not be summed into an end-to-end total.</li>
+    </ul>
+  </details>
+</main>
+
+<script>
+  const BATCHES = 8;
+  const categories = {
+    attention: { label: "Attention", color: "#ff7b89" },
+    projection: { label: "Projection", color: "#8ba7ff" },
+    elementwise: { label: "Elementwise", color: "#ffb454" },
+    cache: { label: "KV cache / GQA", color: "#55c2d9" },
+    rope: { label: "RoPE", color: "#b98cff" },
+    sampling: { label: "Sampling", color: "#4fd1a5" },
+    fused: { label: "Fused Triton", color: "#d4dd72" }
+  };
+
+  const operations = [
+    { name: "Attention (Torch SDPA)", short: "Attention", category: "attention", calls: 224, cpu: 2.772268, gpu: 0.181736 },
+    { name: "Linear projections", short: "Linear", category: "projection", calls: 1352, cpu: 1.929925, gpu: 0.011391 },
+    { name: "Elementwise multiply", short: "Multiply", category: "elementwise", calls: 1792, cpu: 0.805676, gpu: 0.054523 },
+    { name: "GQA KV repeat", short: "GQA repeat", category: "cache", calls: 448, cpu: 0.479869, gpu: 0.041027 },
+    { name: "KV cache scatter", short: "KV scatter", category: "cache", calls: 448, cpu: 0.386615, gpu: 0.031738 },
+    { name: "KV cache gather", short: "KV gather", category: "cache", calls: 464, cpu: 0.353117, gpu: 0.039890 },
+    { name: "Residual / elementwise add", short: "Residual add", category: "elementwise", calls: 896, cpu: 0.350397, gpu: 0.019199 },
+    { name: "RoPE concatenation", short: "RoPE concat", category: "rope", calls: 448, cpu: 0.202686, gpu: 0.024972 },
+    { name: "RoPE negation", short: "RoPE negate", category: "rope", calls: 448, cpu: 0.178554, gpu: 0.017207 },
+    { name: "Triton RMSNorm", short: "RMSNorm", category: "fused", calls: 456, cpu: 0.093290, gpu: 0.012873 },
+    { name: "Sampling softmax", short: "Softmax", category: "sampling", calls: 240, cpu: 0.084269, gpu: 0.022029 },
+    { name: "Sampling multinomial", short: "Multinomial", category: "sampling", calls: 8, cpu: 0.068653, gpu: 0.009642 },
+    { name: "Triton SwiGLU", short: "SwiGLU", category: "fused", calls: 224, cpu: 0.050800, gpu: 0.005227 },
+    { name: "Sampling top-k", short: "Top-k", category: "sampling", calls: 8, cpu: 0.030134, gpu: 0.005386 }
+  ];
+
+  const NS = "http://www.w3.org/2000/svg";
+
+  function svgNode(tag, attributes = {}, text = "") {
+    const node = document.createElementNS(NS, tag);
+    Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, value));
+    if (text) node.textContent = text;
+    return node;
+  }
+
+  function addTitle(node, text) {
+    node.appendChild(svgNode("title", {}, text));
+  }
+
+  function niceMaximum(value) {
+    const power = 10 ** Math.floor(Math.log10(value));
+    const scaled = value / power;
+    const rounded = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 3 ? 3 : scaled <= 5 ? 5 : 10;
+    return rounded * power;
+  }
+
+  function renderBarChart(targetId, key, color) {
+    const target = document.getElementById(targetId);
+    const rows = [...operations].sort((a, b) => b[key] - a[key]);
+    const width = 900;
+    const margin = { top: 16, right: 76, bottom: 48, left: 205 };
+    const rowHeight = 34;
+    const height = margin.top + margin.bottom + rows.length * rowHeight;
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = rows.length * rowHeight;
+    const max = niceMaximum(rows[0][key]);
+    const svg = svgNode("svg", { viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true" });
+
+    for (let tick = 0; tick <= 5; tick += 1) {
+      const value = max * tick / 5;
+      const x = margin.left + plotWidth * tick / 5;
+      svg.appendChild(svgNode("line", {
+        x1: x, y1: margin.top, x2: x, y2: margin.top + plotHeight, class: "grid-line"
+      }));
+      svg.appendChild(svgNode("text", {
+        x, y: margin.top + plotHeight + 22, "text-anchor": "middle", class: "tick-label"
+      }, value.toFixed(value < 0.1 ? 2 : 1)));
+    }
+
+    rows.forEach((op, index) => {
+      const y = margin.top + index * rowHeight + 6;
+      const barWidth = plotWidth * op[key] / max;
+      svg.appendChild(svgNode("text", {
+        x: margin.left - 12, y: y + 14, "text-anchor": "end", class: "bar-label"
+      }, op.name));
+      svg.appendChild(svgNode("rect", {
+        x: margin.left, y, width: plotWidth, height: 20, rx: 5, fill: "#1b2434"
+      }));
+      const bar = svgNode("rect", {
+        x: margin.left, y, width: Math.max(barWidth, 2), height: 20, rx: 5, fill: color
+      });
+      addTitle(bar, `${op.name}: ${op[key].toFixed(4)} ms per request-forward`);
+      svg.appendChild(bar);
+      svg.appendChild(svgNode("text", {
+        x: margin.left + Math.min(barWidth + 8, plotWidth - 2),
+        y: y + 14,
+        "text-anchor": barWidth > plotWidth - 65 ? "end" : "start",
+        class: "bar-value"
+      }, `${op[key].toFixed(3)} ms`));
+    });
+
+    svg.appendChild(svgNode("line", {
+      x1: margin.left, y1: margin.top + plotHeight,
+      x2: margin.left + plotWidth, y2: margin.top + plotHeight, class: "axis-line"
+    }));
+    svg.appendChild(svgNode("text", {
+      x: margin.left + plotWidth / 2, y: height - 6, "text-anchor": "middle", class: "axis-label"
+    }, "milliseconds per request-forward"));
+    target.replaceChildren(svg);
+  }
+
+  function logPosition(value, min, max, length) {
+    return (Math.log10(value) - Math.log10(min)) /
+      (Math.log10(max) - Math.log10(min)) * length;
+  }
+
+  function renderScatter() {
+    const target = document.getElementById("scatter-chart");
+    const width = 1180;
+    const height = 560;
+    const margin = { top: 28, right: 46, bottom: 72, left: 86 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const xMin = 0.025;
+    const xMax = 3.2;
+    const yMin = 0.004;
+    const yMax = 0.24;
+    const xTicks = [0.03, 0.1, 0.3, 1, 3];
+    const yTicks = [0.005, 0.01, 0.03, 0.1, 0.2];
+    const svg = svgNode("svg", { viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true" });
+
+    xTicks.forEach(value => {
+      const x = margin.left + logPosition(value, xMin, xMax, plotWidth);
+      svg.appendChild(svgNode("line", {
+        x1: x, y1: margin.top, x2: x, y2: margin.top + plotHeight, class: "grid-line"
+      }));
+      svg.appendChild(svgNode("text", {
+        x, y: margin.top + plotHeight + 24, "text-anchor": "middle", class: "tick-label"
+      }, value.toString()));
+    });
+
+    yTicks.forEach(value => {
+      const y = margin.top + plotHeight - logPosition(value, yMin, yMax, plotHeight);
+      svg.appendChild(svgNode("line", {
+        x1: margin.left, y1: y, x2: margin.left + plotWidth, y2: y, class: "grid-line"
+      }));
+      svg.appendChild(svgNode("text", {
+        x: margin.left - 12, y: y + 4, "text-anchor": "end", class: "tick-label"
+      }, value.toString()));
+    });
+
+    operations.forEach(op => {
+      const x = margin.left + logPosition(op.cpu, xMin, xMax, plotWidth);
+      const y = margin.top + plotHeight - logPosition(op.gpu, yMin, yMax, plotHeight);
+      const callsPerBatch = op.calls / BATCHES;
+      const radius = 5 + Math.min(13, Math.sqrt(callsPerBatch) * 0.8);
+      const point = svgNode("circle", {
+        cx: x, cy: y, r: radius,
+        fill: categories[op.category].color,
+        "fill-opacity": ".78",
+        stroke: "#eef3fa",
+        "stroke-opacity": ".72",
+        "stroke-width": "1.2"
+      });
+      addTitle(
+        point,
+        `${op.name}\nCPU: ${op.cpu.toFixed(4)} ms\nGPU: ${op.gpu.toFixed(4)} ms\n` +
+        `Calls/batch: ${callsPerBatch.toFixed(1)}`
+      );
+      svg.appendChild(point);
+
+      if (op.cpu >= 0.17 || op.gpu >= 0.03) {
+        const anchor = x > margin.left + plotWidth * 0.78 ? "end" : "start";
+        const dx = anchor === "end" ? -(radius + 5) : radius + 5;
+        svg.appendChild(svgNode("text", {
+          x: x + dx, y: y - radius - 3, "text-anchor": anchor, class: "point-label"
+        }, op.short));
+      }
+    });
+
+    svg.appendChild(svgNode("line", {
+      x1: margin.left, y1: margin.top + plotHeight,
+      x2: margin.left + plotWidth, y2: margin.top + plotHeight, class: "axis-line"
+    }));
+    svg.appendChild(svgNode("line", {
+      x1: margin.left, y1: margin.top,
+      x2: margin.left, y2: margin.top + plotHeight, class: "axis-line"
+    }));
+    svg.appendChild(svgNode("text", {
+      x: margin.left + plotWidth / 2, y: height - 13, "text-anchor": "middle", class: "axis-label"
+    }, "CPU milliseconds per request-forward (log scale)"));
+    const yLabel = svgNode("text", {
+      x: 18, y: margin.top + plotHeight / 2, "text-anchor": "middle",
+      transform: `rotate(-90 18 ${margin.top + plotHeight / 2})`, class: "axis-label"
+    }, "GPU milliseconds per request-forward (log scale)");
+    svg.appendChild(yLabel);
+    target.replaceChildren(svg);
+  }
+
+  function renderLegend() {
+    const legend = document.getElementById("category-legend");
+    Object.values(categories).forEach(category => {
+      const item = document.createElement("span");
+      const swatch = document.createElement("i");
+      swatch.className = "swatch";
+      swatch.style.background = category.color;
+      item.append(swatch, document.createTextNode(category.label));
+      legend.appendChild(item);
+    });
+  }
+
+  function renderTable() {
+    const body = document.getElementById("operation-table");
+    [...operations]
+      .sort((a, b) => b.cpu - a.cpu)
+      .forEach(op => {
+        const row = document.createElement("tr");
+        const ratio = op.cpu / op.gpu;
+        row.innerHTML = `
+          <td>
+            <span class="op-name">
+              <i class="op-dot" style="background:${categories[op.category].color}"></i>
+              ${op.name}
+            </span>
+          </td>
+          <td>${op.calls.toLocaleString()}</td>
+          <td>${(op.calls / BATCHES).toFixed(1)}</td>
+          <td class="cpu-text">${op.cpu.toFixed(6)}</td>
+          <td class="gpu-text">${op.gpu.toFixed(6)}</td>
+          <td>${ratio.toFixed(1)}x</td>
+        `;
+        body.appendChild(row);
+      });
+  }
+
+  renderBarChart("cpu-chart", "cpu", "#ffb454");
+  renderBarChart("gpu-chart", "gpu", "#4fd1a5");
+  renderScatter();
+  renderLegend();
+  renderTable();
+</script>
+</body>
+</html>
