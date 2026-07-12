@@ -369,7 +369,7 @@ def _flash_decode_fwd(
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
     stride_ob, stride_oh, stride_od,
-    Hq, KV_GROUP,
+    Hq, KV_GROUP, POS_STRIDE,
     D: tl.constexpr,
     KV_LEN: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -389,7 +389,7 @@ def _flash_decode_fwd(
 
     # Current decode position, read from a tensor so it varies across graph
     # replays without re-capture.
-    cur = tl.load(pos_ptr).to(tl.int32)
+    cur = tl.load(pos_ptr + b * POS_STRIDE).to(tl.int32)
 
     offs_d = tl.arange(0, D)
     q = tl.load(q_ptr + b * stride_qb + hq * stride_qh + offs_d * stride_qd).to(tl.float32)  # (D,)
@@ -449,8 +449,9 @@ def attention_decode_triton(
         q:       (B, Hq, 1, D)            — the single decode query per head
         k:       (B, Hkv, KV_LEN, D)      — the WHOLE pre-allocated key cache
         v:       (B, Hkv, KV_LEN, D)      — the WHOLE pre-allocated value cache
-        cur_pos: (1,) long tensor         — absolute position of this token; keys
-                                            at positions (0..cur_pos) are attended.
+        cur_pos: (1,) or (B,) long tensor — shared absolute position or one
+                                            position per batch row; keys at
+                                            positions (0..cur_pos[row]) attend.
         sm_scale: 1/sqrt(D) if None.
 
     Returns:
@@ -461,7 +462,10 @@ def attention_decode_triton(
     assert Tq == 1, "attention_decode_triton is decode-only (Tq must be 1)"
     assert k.shape[-1] == D and v.shape[-1] == D
     assert D in (16, 32, 64, 128, 256), f"unsupported head_dim {D}"
+    if cur_pos.numel() not in (1, B):
+        raise ValueError(f"cur_pos must have 1 or B={B} elements; got {cur_pos.numel()}")
     KV_GROUP = Hq // Hkv
+    POS_STRIDE = 0 if cur_pos.numel() == 1 else cur_pos.stride(0)
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
 
@@ -473,8 +477,7 @@ def attention_decode_triton(
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out.stride(0), out.stride(1), out.stride(3),
-        Hq, KV_GROUP,
+        Hq, KV_GROUP, POS_STRIDE,
         D=D, KV_LEN=KV_LEN,
     )
     return out
-
