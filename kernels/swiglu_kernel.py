@@ -59,7 +59,11 @@ def conditional_autotune(configs, key):
         triton.Config({"BLOCK_SIZE": 2048}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=4),
     ],
-    key=["n_rows", "n_cols"],
+    # Each program handles one row tile; n_rows only changes grid size, not the
+    # work or memory pattern inside a program. Keying on it retriggers the full
+    # autotune sweep for every serving batch/prompt shape. n_cols determines the
+    # tile geometry and is the only shape dimension that affects the best config.
+    key=["n_cols"],
 )
 @triton.jit
 def _swiglu_fwd(
