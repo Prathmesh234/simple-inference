@@ -199,8 +199,8 @@ class BatchedDecodeBuffers:
     """Static per-bucket buffers the batched decode graph reads/writes.
 
     Like `GraphDecodeState`, but PER ROW: each of the B rows has its own slot,
-    position, RoPE row and mask, because a continuous-batching decode mixes
-    requests that sit at different absolute positions in different KV slots.
+    position and RoPE row because a continuous-batching decode mixes requests
+    that sit at different absolute positions in different KV slots.
     Every tensor has a fixed address; each step copies fresh values in place
     before `graph.replay()`.
     """
@@ -211,8 +211,6 @@ class BatchedDecodeBuffers:
         self.positions = torch.zeros(B, dtype=torch.long, device=device)
         self.cos = torch.zeros(B, 1, 1, head_dim, dtype=dtype, device=device)
         self.sin = torch.zeros(B, 1, 1, head_dim, dtype=dtype, device=device)
-        # Additive mask over the FULL cache length, broadcast over (B, H, 1, L).
-        self.mask = torch.zeros(B, 1, 1, max_seq_len, dtype=dtype, device=device)
         self.logits: torch.Tensor | None = None  # captured graph output
 
 
@@ -232,9 +230,9 @@ class BatchedGraphDecoder:
       1. **Bucket the batch size.** Capture one graph per preset `B ∈
          {1,2,4,…,max_running}`; a real decode of `R` rounds UP to the smallest
          bucket `B ≥ R` and the extra `B−R` rows are padding.
-      2. **Read the full cache length under a mask** (not a dynamic `[:Lmax]`
-         slice) so attention shapes are constant — same trick `CUDAGraphDecoder`
-         uses, generalised to per-row masks.
+      2. **Read the full cache length with per-row positions** (not a dynamic
+         `[:Lmax]` slice) so attention shapes are constant. The custom kernel
+         applies each row's length mask inside its online-softmax loop.
       3. **A reserved scratch KV slot** (`max_running`, never handed out by the
          scheduler) absorbs padding rows so they can't scribble on a real
          request's KV. Their logits are sliced off.
@@ -313,12 +311,14 @@ class BatchedGraphDecoder:
         self.kv.k_cache[li][bufs.slots, :, bufs.positions, :] = k[:, 0]
         self.kv.v_cache[li][bufs.slots, :, bufs.positions, :] = v[:, 0]
 
-        # Fixed-length read over the whole cache row; the additive mask hides
-        # positions beyond each row's pos (and confines padding rows to scratch).
+        # Fixed-length read over the whole cache row. The custom decode kernel
+        # reads each row's position tensor and masks later cache columns inside
+        # the online-softmax loop, so the graph needs no materialized mask.
         K = self.kv.k_cache[li][bufs.slots]   # (B, nkv, max_seq_len, D)
         V = self.kv.v_cache[li][bufs.slots]
         qT = q.transpose(1, 2)                # (B, nq, 1, D)
-        out = F.scaled_dot_product_attention(qT, K, V, attn_mask=bufs.mask, enable_gqa=self.gqa)
+        from kernels.attention_kernel import attention_decode_triton
+        out = attention_decode_triton(qT, K, V, bufs.positions)
         out = out.transpose(1, 2).reshape(B, 1, self.nq * self.D)
         return h + F.linear(out, attn.wo)
 
@@ -333,8 +333,6 @@ class BatchedGraphDecoder:
         sin0 = self.model.rope_freqs.sin[0:1].to(self.dtype).view(1, 1, 1, self.D)
         bufs.cos.copy_(cos0)  # broadcasts (1,1,1,D) → (B,1,1,D)
         bufs.sin.copy_(sin0)
-        bufs.mask.fill_(float("-inf"))
-        bufs.mask[..., 0] = 0.0  # attend position 0 only
 
     def _fill_for_decode(self, bufs: BatchedDecodeBuffers, B: int,
                          slots: list[int], positions: list[int],
@@ -355,12 +353,6 @@ class BatchedGraphDecoder:
         pos = bufs.positions
         bufs.cos.copy_(self.model.rope_freqs.cos[pos].to(self.dtype).view(B, 1, 1, self.D))
         bufs.sin.copy_(self.model.rope_freqs.sin[pos].to(self.dtype).view(B, 1, 1, self.D))
-
-        cols = torch.arange(self.max_seq_len, device=dev)
-        allowed = cols[None, :] <= pos[:, None]            # (B, max_seq_len)
-        neg = torch.zeros(B, self.max_seq_len, dtype=self.dtype, device=dev)
-        neg.masked_fill_(~allowed, float("-inf"))
-        bufs.mask.copy_(neg.view(B, 1, 1, self.max_seq_len))
 
     # ── capture / replay ──────────────────────────────────────────────────
 
