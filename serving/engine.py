@@ -14,9 +14,9 @@ Every position-agnostic module of the model is reused verbatim — `embed`, each
 block's `attn_norm` / `mlp_norm` / `mlp`, the final `norm`, and `head`. The only
 thing continuous batching actually changes is attention, because attention is
 the one op that depends on absolute position and on per-request history. So the
-engine implements just the attention math itself (Q/K/V projections via the
-block's own weights, RoPE, KV read/write, masked SDPA) and leaves the entire
-rest of the model untouched. Nothing in model/ or ops/ is modified.
+engine implements just the attention plumbing itself (Q/K/V projections via
+the block's own weights, RoPE, KV read/write, and serving-aware masks/positions)
+and leaves the entire rest of the model untouched.
 
 The two batched forward shapes
 ------------------------------
@@ -31,8 +31,8 @@ followed by one batched decode of the steady-state requests.
     padding keys unreachable.
   - DECODE   (R requests, T = 1 each, but every request at a DIFFERENT absolute
     position): write each request's single new K/V at its own position into its
-    own KV-cache slot, then attend over the whole valid prefix with a per-row
-    length mask. This "ragged" step is the heart of continuous batching.
+    own KV-cache slot, then attend over the fixed cache with each row's position
+    supplied to the kernel. This "ragged" step is the heart of continuous batching.
 
 KV cache as a slot pool
 -----------------------
@@ -41,11 +41,9 @@ request) instead of treating the batch dim as "the current sequence". A request
 holds slot s for its lifetime; row s of the cache is its private history. When
 the request finishes, the scheduler hands slot s to the next waiting request.
 
-Attention runs through PyTorch SDPA (with enable_gqa + a causal or additive
-mask) rather than the custom Triton kernels: SDPA trivially supports the padded
-prefill and per-row ragged decode masks this engine needs, and keeps the serving
-path simple and robust. The custom Triton/CUDA-graph kernels remain the path for
-the single-stream `generate()` engine.
+With `USE_TRITON=true`, prefill uses the custom variable-length FlashAttention
+kernel and decode uses the fixed-cache custom kernel with one position per row.
+`USE_TRITON=false` retains PyTorch SDPA as the correctness fallback.
 
 Optional CUDA graphs for decode (Section 19)
 --------------------------------------------
@@ -56,8 +54,8 @@ launches into one replay — the main win for memory-bound
 decode where the CPU, not the GPU, is the bottleneck. Capture needs fixed shapes,
 so the ragged batch is bucketed to preset sizes (1, 2, 4, … max_running), padded
 rows use a reserved scratch KV slot, and attention reads the full cache length
-under a mask. Prefill stays eager (its token count varies every call). With the
-flag off, decode runs the eager ragged SDPA path described above.
+while masking from per-row position tensors inside the kernel. Prefill stays
+eager because its token count varies every call.
 """
 
 from __future__ import annotations
@@ -66,6 +64,7 @@ import os
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 from model.cuda_graph import BatchedGraphDecoder
 from model.kv_cache import KVCache
@@ -80,6 +79,7 @@ from serving.scheduler import Scheduler
 # driver of memory-bound decode's CPU overhead). Prefill stays eager. Defaults
 # off; toggle with the same USE_CUDA_GRAPHS env var the single-stream path uses.
 USE_CUDA_GRAPHS = os.environ.get("USE_CUDA_GRAPHS", "false").lower() in ("1", "true", "yes", "on")
+USE_TRITON_ATTENTION = os.environ.get("USE_TRITON", "true").lower() in ("1", "true", "yes", "on")
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -208,15 +208,14 @@ class InferenceEngine:
         """
         Exercise the exact prefill + ragged-decode path on dummy requests so the
         first real request doesn't eat one-time costs: Triton kernel
-        compilation/autotuning (RMSNorm, MLP), SDPA backend selection, and CUDA
+        compilation/autotuning (RMSNorm, MLP, attention) and CUDA
         caching-allocator growth. Engine state is fully reset afterwards.
 
         When CUDA graphs are enabled, every per-batch-size decode graph is also
         captured here (after the eager warmup primes/autotunes the kernels) so
         the serving loop only ever *replays* and never pays capture cost mid-
-        flight. With graphs off, the ragged decode runs eager SDPA — which is
-        what lets a variable batch composition work at all, since graph capture
-        needs fixed shapes (hence the bucketing in model/cuda_graph.py).
+        flight. With graphs off, the same custom decode kernel runs eagerly;
+        graph bucketing removes its Python/kernel-launch overhead.
         """
         num_seqs = max(1, min(num_seqs, self.max_running))
         prompt_len = max(1, min(prompt_len, self.max_seq_len - decode_steps - 1))
@@ -235,7 +234,7 @@ class InferenceEngine:
                 # CUDA-graph capture is driver/arch/memory-dependent and can fail
                 # (e.g. capture-unsafe op, OOM on the static buffers). A failure
                 # here must NOT kill the engine: drop the graph decoder so every
-                # decode runs the eager ragged-SDPA path instead.
+                # decode runs the eager custom-kernel path instead.
                 print(
                     f"[engine] CUDA-graph capture failed ({type(e).__name__}: {e}); "
                     f"falling back to eager decode."
@@ -255,7 +254,8 @@ class InferenceEngine:
         a token this iteration (prefilled requests emit their first token; decode
         requests emit their next).
         """
-        self.scheduler.step_schedule()  # evict finished, admit waiting
+        with record_function("engine.schedule"):
+            self.scheduler.step_schedule()  # evict finished, admit waiting
 
         emitted: dict[int, int] = {}
 
@@ -276,13 +276,15 @@ class InferenceEngine:
         #    lengths are padded to the batch max; padding queries are discarded).
         prefill_reqs = [r for r in self.scheduler.running if r.state is RequestState.PREFILL]
         if prefill_reqs:
-            toks = self._prefill_batch(prefill_reqs)
+            with record_function("engine.prefill_batch"):
+                toks = self._prefill_batch(prefill_reqs)
             for req, tok in zip(prefill_reqs, toks):
                 emitted[req.id] = tok
 
         # 2. One ragged decode over every request already in steady state.
         if decode_reqs:
-            toks = self._decode_batch(decode_reqs)
+            with record_function("engine.decode_batch"):
+                toks = self._decode_batch(decode_reqs)
             for req, tok in zip(decode_reqs, toks):
                 emitted[req.id] = tok
 
@@ -364,10 +366,21 @@ class InferenceEngine:
         K = self.kv.k_cache[li][slots, :, :Lmax, :]            # (R, Hkv, Lmax, D)
         V = self.kv.v_cache[li][slots, :, :Lmax, :]
         qT = q.transpose(1, 2)                                 # (R, Hq, Lmax, D)
-        out = F.scaled_dot_product_attention(
-            qT, K, V, is_causal=True, enable_gqa=(self.kv_groups > 1)
-        )
-        out = out.transpose(1, 2).reshape(R, Lmax, self.n_heads_q * self.head_dim)
+        if USE_TRITON_ATTENTION and qT.is_cuda:
+            from kernels.attention_kernel import attention_prefill_triton
+            out = attention_prefill_triton(
+                qT,
+                K,
+                V,
+                causal=True,
+                return_transposed=True,
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                qT, K, V, is_causal=True, enable_gqa=(self.kv_groups > 1)
+            )
+            out = out.transpose(1, 2)
+        out = out.reshape(R, Lmax, self.n_heads_q * self.head_dim)
         return h + F.linear(out, attn.wo)
 
     # ── decode (ragged batch) ─────────────────────────────────────────────
@@ -376,10 +389,8 @@ class InferenceEngine:
         """
         One decode step over the steady-state requests. Computes next-token
         logits either by replaying a captured CUDA graph (when enabled and the
-        batch fits a bucket) or via the eager ragged-SDPA path, then samples and
-        advances each request. Both paths write the new K/V into the cache and
-        produce identical logits — the graph just reads the full cache length
-        under a mask instead of a dynamic `[:Lmax]` slice.
+        batch fits a bucket) or by launching the same custom decode kernel
+        eagerly, then samples and advances each request.
         """
         logits = None
         if self.graph_decoder is not None:
@@ -413,23 +424,27 @@ class InferenceEngine:
         return toks
 
     def _decode_logits_eager(self, reqs: list[Request]) -> torch.Tensor:
-        """Eager ragged decode: write each row's new K/V, attend over its own
-        valid prefix with a per-row length mask, return logits (R, vocab)."""
+        """Eager ragged decode using the same per-row-position kernel as graphs."""
         R = len(reqs)
         slots = torch.tensor([r.slot for r in reqs], dtype=torch.long, device=self.device)
         positions = torch.tensor([r.pos for r in reqs], dtype=torch.long, device=self.device)
         last = torch.tensor([[r.last_token] for r in reqs], dtype=torch.long, device=self.device)
-        Lmax = int(positions.max().item()) + 1       # only read the valid prefix
 
         h = self.model.embed(last)                   # (R, 1, hidden)
         cos = self.model.rope_freqs.cos[positions].to(self.dtype).view(R, 1, 1, self.head_dim)
         sin = self.model.rope_freqs.sin[positions].to(self.dtype).view(R, 1, 1, self.head_dim)
 
-        # Per-row additive length mask: row r may attend to columns [0, pos_r].
-        cols = torch.arange(Lmax, device=self.device)
-        allowed = cols[None, :] <= positions[:, None]            # (R, Lmax) bool
-        mask = torch.zeros(R, 1, 1, Lmax, dtype=self.dtype, device=self.device)
-        mask.masked_fill_(~allowed.view(R, 1, 1, Lmax), float("-inf"))
+        mask = None
+        Lmax = self.max_seq_len
+        if not (USE_TRITON_ATTENTION and h.is_cuda):
+            # PyTorch fallback reads only the longest valid prefix and needs an
+            # explicit per-row length mask. The Triton path reads the fixed full
+            # cache and applies positions inside the kernel, matching graph mode.
+            Lmax = int(positions.max().item()) + 1
+            cols = torch.arange(Lmax, device=self.device)
+            allowed = cols[None, :] <= positions[:, None]
+            mask = torch.zeros(R, 1, 1, Lmax, dtype=self.dtype, device=self.device)
+            mask.masked_fill_(~allowed.view(R, 1, 1, Lmax), float("-inf"))
 
         for layer in self.model.layers:
             h = self._attn_decode(h, layer, slots, positions, Lmax, cos, sin, mask, R)
@@ -456,9 +471,13 @@ class InferenceEngine:
         K = self.kv.k_cache[li][slots, :, :Lmax, :]              # (R, Hkv, Lmax, D)
         V = self.kv.v_cache[li][slots, :, :Lmax, :]
         qT = q.transpose(1, 2)                                   # (R, Hq, 1, D)
-        out = F.scaled_dot_product_attention(
-            qT, K, V, attn_mask=mask, enable_gqa=(self.kv_groups > 1)
-        )
+        if USE_TRITON_ATTENTION and qT.is_cuda:
+            from kernels.attention_kernel import attention_decode_triton
+            out = attention_decode_triton(qT, K, V, positions)
+        else:
+            out = F.scaled_dot_product_attention(
+                qT, K, V, attn_mask=mask, enable_gqa=(self.kv_groups > 1)
+            )
         out = out.transpose(1, 2).reshape(R, 1, self.n_heads_q * self.head_dim)
         return h + F.linear(out, attn.wo)
 
