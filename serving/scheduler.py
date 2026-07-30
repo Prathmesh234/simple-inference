@@ -23,10 +23,11 @@ What the scheduler owns
 -----------------------
   - `waiting`:  FCFS queue of not-yet-admitted requests
   - `running`:  requests currently holding a KV slot
-  - `free_slots`: the pool of available KV-cache rows (0 .. max_running-1)
+  - `free_slots`: admission-capacity slots (contiguous mode also maps each to
+    one KV-cache row; paged mode maps request IDs through block tables instead)
 
 Two budgets bound a batch:
-  - `max_running`   : hard cap = number of KV-cache slots (rows) we allocated
+  - `max_running`   : hard cap on concurrently admitted requests
   - `token_budget`  : soft cap on Σ context length across running requests, the
                       knob that keeps a single step's compute/memory bounded
 """
@@ -34,6 +35,7 @@ Two budgets bound a batch:
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 
 from serving.request import Request, RequestState
 
@@ -88,7 +90,7 @@ class Scheduler:
         """Σ context length over the running set (prompt + already generated)."""
         return sum(r.prompt_len + r.num_generated for r in self.running)
 
-    def admit(self) -> list[Request]:
+    def admit(self, can_admit: Callable[[Request], bool] | None = None) -> list[Request]:
         """
         Move WAITING → PREFILL for as many head-of-queue requests as fit in the
         free slots and the token budget. Returns the newly admitted requests so
@@ -104,6 +106,11 @@ class Scheduler:
             if self.running or admitted:
                 if budget_used + nxt.prompt_len > self.token_budget:
                     break
+            # A paged KV cache may have less physical capacity than the
+            # scheduler's request-slot limit. Keep FCFS ordering: if the first
+            # waiting request cannot reserve pages, later requests do not jump it.
+            if can_admit is not None and not can_admit(nxt):
+                break
 
             self.waiting.popleft()
             nxt.slot = self.free_slots.pop(0)
@@ -115,7 +122,9 @@ class Scheduler:
 
         return admitted
 
-    def step_schedule(self) -> tuple[list[Request], list[Request]]:
+    def step_schedule(
+        self, can_admit: Callable[[Request], bool] | None = None
+    ) -> tuple[list[Request], list[Request]]:
         """
         Run one scheduling round.
 
@@ -125,7 +134,7 @@ class Scheduler:
             `self.running` is the exact set the engine will run this iteration.
         """
         evicted = self.evict_finished()
-        admitted = self.admit()
+        admitted = self.admit(can_admit=can_admit)
         return evicted, admitted
 
     def __repr__(self) -> str:

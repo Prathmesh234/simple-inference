@@ -23,8 +23,9 @@ Lifecycle
     FINISHED  done; its slot is released back to the pool
 
 The Request carries everything needed to resume it next iteration:
-  - `slot`: which row of the KV-cache pool holds this request's K/V (None until
-    admitted). This is the contiguous-cache analogue of vLLM's block table.
+  - `slot`: an admission-capacity slot (None until admitted). The contiguous
+    cache uses it as a KV row; the paged cache instead uses `id` to find this
+    request's block table.
   - `pos`:  absolute position of the NEXT token to write — equals prompt_len
     after prefill, then increments by one per decoded token. Drives both the
     KV write index and the RoPE angle for this request.
@@ -55,7 +56,7 @@ class Request:
     # assigned by the engine / scheduler ------------------------------------
     id: int = field(default_factory=lambda: next(_id_counter))
     state: RequestState = RequestState.WAITING
-    slot: int | None = None          # KV-cache row, assigned on admission
+    slot: int | None = None          # admission slot; a KV row only in contiguous mode
     pos: int = 0                     # absolute index of the NEXT token to write
     generated: list[int] = field(default_factory=list)
     eos_hit: bool = False
