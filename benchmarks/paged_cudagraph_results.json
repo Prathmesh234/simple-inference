@@ -1,0 +1,74 @@
+{
+  "gpu": "NVIDIA RTX 6000 Ada Generation",
+  "model_id": "meta-llama/Llama-3.2-3B",
+  "context_len": 512,
+  "max_seq_len": 576,
+  "block_size": 16,
+  "rows": [
+    {
+      "batch_size": 1,
+      "gathered_eager_ms": 37.79071807861328,
+      "direct_eager_ms": 26.658132553100586,
+      "graph_ms": 10.293248176574707,
+      "cuda_graph_speedup": 2.589865909749359,
+      "gathered_to_graph_speedup": 3.6714084252449193,
+      "gathered_eager_tokens_per_second": 26.461524174263445,
+      "direct_eager_tokens_per_second": 37.51200493913407,
+      "graph_tokens_per_second": 97.15106279821292,
+      "max_abs_logit_diff": 0.09375,
+      "top1_agreement": 1.0
+    },
+    {
+      "batch_size": 2,
+      "gathered_eager_ms": 44.70783996582031,
+      "direct_eager_ms": 27.994112014770508,
+      "graph_ms": 10.589987754821777,
+      "cuda_graph_speedup": 2.643450838932687,
+      "gathered_to_graph_speedup": 4.221708372180522,
+      "gathered_eager_tokens_per_second": 44.73488322247338,
+      "direct_eager_tokens_per_second": 71.44359495828057,
+      "graph_tokens_per_second": 188.85763102883385,
+      "max_abs_logit_diff": 0.0625,
+      "top1_agreement": 1.0
+    },
+    {
+      "batch_size": 4,
+      "gathered_eager_ms": 56.34048080444336,
+      "direct_eager_ms": 26.642431259155273,
+      "graph_ms": 10.636401176452637,
+      "cuda_graph_speedup": 2.504835123945638,
+      "gathered_to_graph_speedup": 5.296949585652388,
+      "gathered_eager_tokens_per_second": 70.99690920075598,
+      "direct_eager_tokens_per_second": 150.1364481751439,
+      "graph_tokens_per_second": 376.0670487735445,
+      "max_abs_logit_diff": 0.0625,
+      "top1_agreement": 1.0
+    },
+    {
+      "batch_size": 8,
+      "gathered_eager_ms": 74.75609588623047,
+      "direct_eager_ms": 26.767038345336914,
+      "graph_ms": 10.916991233825684,
+      "cuda_graph_speedup": 2.451869546473643,
+      "gathered_to_graph_speedup": 6.847683055254539,
+      "gathered_eager_tokens_per_second": 107.01468428976027,
+      "direct_eager_tokens_per_second": 298.87505284624365,
+      "graph_tokens_per_second": 732.8026402744055,
+      "max_abs_logit_diff": 0.08203125,
+      "top1_agreement": 1.0
+    },
+    {
+      "batch_size": 16,
+      "gathered_eager_ms": 116.42880249023438,
+      "direct_eager_ms": 26.600448608398438,
+      "graph_ms": 11.733887672424316,
+      "cuda_graph_speedup": 2.266976585340242,
+      "gathered_to_graph_speedup": 9.922440519338911,
+      "gathered_eager_tokens_per_second": 137.42304015659718,
+      "direct_eager_tokens_per_second": 601.4936152222783,
+      "graph_tokens_per_second": 1363.5719419405582,
+      "max_abs_logit_diff": 0.0625,
+      "top1_agreement": 1.0
+    }
+  ]
+}

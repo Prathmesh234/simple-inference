@@ -1,0 +1,24 @@
+{
+  "model_id": "meta-llama/Llama-3.2-3B",
+  "gpu": "NVIDIA RTX 6000 Ada Generation",
+  "total_vram_gb": 50.865,
+  "model_allocated_gb": 6.56,
+  "free_after_model_gb": 43.727,
+  "headroom_gb": 0.0,
+  "max_seq_len": 8192,
+  "block_size": 16,
+  "kv_budget_gb": 43.218,
+  "workload": {
+    "prompt_min": 64,
+    "prompt_max": 1024,
+    "max_new_tokens": 256,
+    "request_tokens": 8124,
+    "seed": 0
+  },
+  "contiguous_threshold": 46,
+  "paged_threshold": 46,
+  "improvement": 1.0,
+  "paged_blocks_used": 23368,
+  "paged_blocks_total": 23552,
+  "paged_utilization": 0.9922
+}
