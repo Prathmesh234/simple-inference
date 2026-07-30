@@ -22,7 +22,10 @@ The FastAPI lifespan does, before any endpoint accepts traffic:
 Run
 ---
     XDG_CONFIG_HOME=~/.cache/xdgconfig UV_CACHE_DIR=~/.cache/uv PATH=~/.local/bin:$PATH \
-    USE_CUDA_GRAPHS=false uv run uvicorn serving.server:app --host 0.0.0.0 --port 8000
+    uv run uvicorn serving.server:app --host 0.0.0.0 --port 8000
+
+  PagedAttention and CUDA-graph decode are enabled by default. Set
+  `SERVE_USE_CUDA_GRAPHS=false` to compare against eager gathered paging.
 
   (single worker process only — the model is loaded once in-process; do not run
    uvicorn with --workers > 1.)
@@ -65,12 +68,18 @@ MODEL_ID = os.environ.get("SERVE_MODEL_ID", "meta-llama/Llama-3.2-3B")
 DEVICE = os.environ.get("SERVE_DEVICE", "cuda")
 MAX_RUNNING = int(os.environ.get("SERVE_MAX_RUNNING", "8"))
 MAX_SEQ_LEN = int(os.environ.get("SERVE_MAX_SEQ_LEN", "4096"))
+PAGED_BLOCK_SIZE = int(os.environ.get("SERVE_PAGED_BLOCK_SIZE", "16"))
+_KB = os.environ.get("SERVE_KV_BLOCKS", "")
+NUM_KV_BLOCKS = int(_KB) if _KB else None
 _TB = os.environ.get("SERVE_TOKEN_BUDGET", "")
 TOKEN_BUDGET = int(_TB) if _TB else None
 TEMPERATURE = float(os.environ.get("SERVE_TEMPERATURE", "0.7"))
 TOP_K = int(os.environ.get("SERVE_TOP_K", "50"))
 TOP_P = float(os.environ.get("SERVE_TOP_P", "0.9"))
 DEFAULT_MAX_NEW = int(os.environ.get("SERVE_DEFAULT_MAX_NEW", "128"))
+USE_PAGED_CUDA_GRAPHS = os.environ.get(
+    "SERVE_USE_CUDA_GRAPHS", "true"
+).lower() in ("1", "true", "yes", "on")
 DTYPE = torch.bfloat16
 
 
@@ -216,11 +225,15 @@ def _load() -> None:
         model=model,
         max_running=MAX_RUNNING,
         max_seq_len=MAX_SEQ_LEN,
+        block_size=PAGED_BLOCK_SIZE,
+        num_kv_blocks=NUM_KV_BLOCKS,
         token_budget=TOKEN_BUDGET,
         temperature=TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
         warmup=True,
+        use_cuda_graphs=USE_PAGED_CUDA_GRAPHS,
+        use_paged_attention=True,
     )
     state.worker = _Worker(state.engine)
     state.worker.start()
@@ -280,6 +293,10 @@ def health() -> dict:
         "model_id": MODEL_ID,
         "max_running": MAX_RUNNING,
         "max_seq_len": MAX_SEQ_LEN,
+        "paged_attention": eng.use_paged_attention if ready else True,
+        "cuda_graphs": eng.graph_decoder is not None if ready else USE_PAGED_CUDA_GRAPHS,
+        "paged_block_size": PAGED_BLOCK_SIZE,
+        "kv_blocks": eng.num_kv_blocks if ready else NUM_KV_BLOCKS,
         "sampling": {"temperature": TEMPERATURE, "top_k": TOP_K, "top_p": TOP_P},
         "running": len(sched.running) if sched else 0,
         "waiting": len(sched.waiting) if sched else 0,

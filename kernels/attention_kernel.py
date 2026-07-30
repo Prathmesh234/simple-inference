@@ -481,3 +481,172 @@ def attention_decode_triton(
         D=D, KV_LEN=KV_LEN,
     )
     return out
+
+
+# ===========================================================================
+# PAGED DECODE flash: fixed metadata buffers + direct physical-page reads.
+#
+# Unlike `attention_decode_triton`, K/V is not one contiguous row per request.
+# The kernel translates each logical page through `block_tables[b, page]`, then
+# streams that physical page directly into the online softmax. Both the page
+# table and positions are fixed-address tensors whose VALUES change before a
+# CUDA-graph replay.
+# ===========================================================================
+
+@triton.jit
+def _flash_paged_decode_fwd(
+    q_ptr, k_ptr, v_ptr, o_ptr, block_table_ptr, pos_ptr, sm_scale,
+    stride_qb, stride_qh, stride_qd,
+    stride_kblock, stride_kh, stride_kt, stride_kd,
+    stride_vblock, stride_vh, stride_vt, stride_vd,
+    stride_ob, stride_oh, stride_od,
+    stride_btb, stride_btl,
+    Hq, KV_GROUP,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+):
+    """
+    One program per (batch row, query head), for a single decode query.
+
+    `block_table_ptr[b, logical_block]` maps logical sequence pages to the
+    physical page pool. The loop trip count is compile-time constant, making it
+    CUDA-graph safe; pages beyond the row's current position are masked.
+    """
+    off_bh = tl.program_id(0)
+    b = off_bh // Hq
+    hq = off_bh % Hq
+    hkv = hq // KV_GROUP
+    cur = tl.load(pos_ptr + b).to(tl.int32)
+
+    offs_d = tl.arange(0, D)
+    q = tl.load(
+        q_ptr + b * stride_qb + hq * stride_qh + offs_d * stride_qd
+    ).to(tl.float32)
+
+    m_i = float("-inf")
+    l_i = 0.0
+    acc = tl.zeros((D,), dtype=tl.float32)
+    token_offsets = tl.arange(0, BLOCK_SIZE)
+
+    for logical_block in range(0, MAX_BLOCKS):
+        physical_block = tl.load(
+            block_table_ptr
+            + b * stride_btb
+            + logical_block * stride_btl
+        ).to(tl.int32)
+        block_start = logical_block * BLOCK_SIZE
+        token_positions = block_start + token_offsets
+        valid_block = physical_block >= 0
+        valid = valid_block & (token_positions <= cur)
+        # A masked load must still receive an in-range base pointer.
+        safe_block = tl.where(valid_block, physical_block, 0)
+
+        k_base = (
+            k_ptr
+            + safe_block * stride_kblock
+            + hkv * stride_kh
+        )
+        k = tl.load(
+            k_base
+            + token_offsets[:, None] * stride_kt
+            + offs_d[None, :] * stride_kd,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
+        qk = tl.where(valid, qk, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=0))
+        p = tl.exp(qk - m_new)
+        alpha = tl.exp(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+
+        v_base = (
+            v_ptr
+            + safe_block * stride_vblock
+            + hkv * stride_vh
+        )
+        v = tl.load(
+            v_base
+            + token_offsets[:, None] * stride_vt
+            + offs_d[None, :] * stride_vd,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_new
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe
+    tl.store(
+        o_ptr + b * stride_ob + hq * stride_oh + offs_d * stride_od,
+        acc.to(o_ptr.dtype.element_ty),
+    )
+
+
+def attention_paged_decode_triton(
+    q: torch.Tensor,
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    cur_pos: torch.Tensor,
+    block_size: int,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    """
+    CUDA-graph-safe single-token attention over a paged physical KV pool.
+
+    Args:
+        q:            (B, Hq, 1, D)
+        k_pool/v_pool:(num_physical_blocks, Hkv, block_size, D)
+        block_tables: (B, max_blocks_per_request), -1 for unused logical pages
+        cur_pos:      (B,) absolute decode positions
+        block_size:   tokens per physical page
+
+    Returns:
+        (B, Hq, 1, D)
+    """
+    B, Hq, Tq, D = q.shape
+    num_blocks, Hkv, pool_block_size, pool_d = k_pool.shape
+    if Tq != 1:
+        raise ValueError("attention_paged_decode_triton requires Tq=1")
+    if v_pool.shape != k_pool.shape:
+        raise ValueError("K/V physical pools must have identical shapes")
+    if pool_block_size != block_size:
+        raise ValueError(
+            f"block_size mismatch: pool={pool_block_size}, argument={block_size}"
+        )
+    if pool_d != D:
+        raise ValueError(f"head_dim mismatch: q={D}, pool={pool_d}")
+    if block_tables.shape[0] != B or cur_pos.shape != (B,):
+        raise ValueError("block_tables/cur_pos batch dimension must match q")
+    if Hq % Hkv != 0:
+        raise ValueError(f"Hq={Hq} must be divisible by Hkv={Hkv}")
+    if block_tables.dtype != torch.long or cur_pos.dtype != torch.long:
+        raise ValueError("block_tables and cur_pos must be torch.long")
+    if D not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head_dim {D}")
+    if block_size <= 0 or block_size & (block_size - 1):
+        raise ValueError("block_size must be a positive power of two")
+    if sm_scale is None:
+        sm_scale = 1.0 / (D ** 0.5)
+
+    max_blocks = block_tables.shape[1]
+    out = torch.empty((B, Hq, 1, D), dtype=q.dtype, device=q.device)
+    _flash_paged_decode_fwd[(B * Hq,)](
+        q, k_pool, v_pool, out, block_tables, cur_pos, sm_scale,
+        q.stride(0), q.stride(1), q.stride(3),
+        k_pool.stride(0), k_pool.stride(1), k_pool.stride(2), k_pool.stride(3),
+        v_pool.stride(0), v_pool.stride(1), v_pool.stride(2), v_pool.stride(3),
+        out.stride(0), out.stride(1), out.stride(3),
+        block_tables.stride(0), block_tables.stride(1),
+        Hq, Hq // Hkv,
+        D=D,
+        BLOCK_SIZE=block_size,
+        MAX_BLOCKS=max_blocks,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
