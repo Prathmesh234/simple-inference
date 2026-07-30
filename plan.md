@@ -593,12 +593,12 @@ existing single-stream benchmarks can't regress.
 
 ---
 
-## Section 16 — PagedAttention  *(vLLM's signature optimization — independent)*
+## ✅ Section 16 — PagedAttention  *(vLLM's signature optimization — independent)*
 
 **Builds on:** Section 15 (continuous batching). Independent of Section 17.
 
 **Files:** `serving/paged_kv_cache.py`, `serving/block_allocator.py`,
-modify `ops/attention.py` to add `paged_attention_forward()`
+`serving/engine.py`
 
 **Problem it solves**
 The Section 11 KV cache pre-allocates `(max_batch, max_seq_len, n_kv_heads, head_dim)`
@@ -656,6 +656,120 @@ Same as #6 but ramp concurrent requests until OOM. Report **max concurrency**.
 
 **Learned:** OS-style paging for tensors, block tables, why fragmentation is the
 hidden killer in naive KV caches, the gather-based attention pattern.
+
+**Implemented (gathered reference path)**
+- `serving/block_allocator.py` owns a fixed physical-page pool, request capacity
+  reservations, free-list allocation, and ref-count primitives for future prefix
+  sharing.
+- `serving/paged_kv_cache.py` stores K/V as
+  `(layer, physical_block, kv_head, block_offset, head_dim)` and translates each
+  request's logical positions through its `block_tables[request_id]`.
+- `serving/engine.py` reserves the declared request capacity at admission,
+  allocates physical blocks only as prefill/decode writes reach them, gathers
+  logical K/V prefixes, and applies the per-request causal/length mask in SDPA.
+  Eager decode uses the gathered reference path.
+- `serving/paged_cuda_graph.py` combines paging with decode CUDA graphs:
+  fixed-size token, position, RoPE, and block-table buffers are updated in
+  place before replay; page allocation remains outside capture; padding rows
+  write to one reserved scratch page.
+- `attention_paged_decode_triton` reads the fixed block-table buffer directly
+  and performs online-softmax attention over physical pages, eliminating the
+  gathered K/V temporary inside graph replay.
+- `serving/test_paged_kv_cache.py` is CPU-only coverage for allocator lifetime,
+  cross-page write/gather order, gathered-attention masking, engine parity, and
+  page reuse. Run `uv run python -m unittest serving.test_paged_kv_cache -v`.
+- `benchmarks/bench_paged_attention.py` measures capacity and the reference
+  gather cost without model weights. With a pool equal to 8×4096 contiguous
+  token slots, prompt U[64,1024] + 256 decode averaged **40.2 concurrent
+  requests vs 8 (5.02×)**; eight 800-token requests need **0.734 GB vs
+  3.758 GB (80.5% less KV memory)**. The CPU attention microbenchmark measured
+  gather+SDPA slower than contiguous SDPA, confirming this is not the final
+  throughput path.
+- `benchmarks/stress_paged_kv.py` drives one contiguous and one paged instance
+  to their admission limits under the exact same **3.758 GB / 32,768-token-slot**
+  KV budget. For prompt U[64,1024] + 256 decode, contiguous fills at **8**
+  requests; paged averages **40.1** (p05/p50/p95 = **36/40/44**, max 51),
+  a **5.01×** concurrency increase with **98.7%** mean page utilization.
+  `--allocate` performs the real one-at-a-time CUDA tensor allocations.
+- `benchmarks/bench_paged_threshold.py` is the real Llama-3.2-3B GPU harness:
+  it loads model weights, finds how many full contiguous rows fit in current
+  free VRAM, allocates an exactly equal-byte paged pool, and admits mixed
+  requests until each strategy reaches its threshold. `--headroom-gb 0` probes
+  the CUDA allocation boundary; `--execute-threshold` also runs the measured
+  batches through prefill and decode, reporting activation OOM separately from
+  KV-capacity exhaustion.
+- `benchmarks/bench_paged_cudagraph.py` compares gathered SDPA, the direct
+  paged Triton kernel, and CUDA-graph replay of that same direct kernel.
+
+**Measured results and findings**
+
+| Measurement | Contiguous KV | Paged KV | Result |
+|---|---:|---:|---:|
+| **RTX 6000 Ada hard KV threshold**, real Llama-3.2-3B, 43.688 GB equal cache budget | 93 | 464 | **4.99×** |
+| Real-GPU page utilization at hard threshold | — | 23,793 / 23,808 blocks | **99.94%** |
+| **RTX 6000 Ada safe execution-budget threshold**, 37.581 GB equal KV budget | 80 | 398 | **4.97×** KV capacity |
+| Threshold execution with 6 GB reserved headroom | pass: 28.635 s, 49.580 GB peak | OOM requesting 2.33 GiB | paged KV fits; 398-way prefill activations do not |
+| Mixed workload concurrency, prompt U[64,1024] + 256 decode | 8 | 40.1 mean | **5.01×** |
+| Mixed concurrency distribution | fixed at 8 | p05/p50/p95 = 36/40/44; max 51 | substantially better tail capacity |
+| Fixed 384-token request cap | 8 | 85 | **10.62×** |
+| Fixed 800-token request cap | 8 | 40 | **5.00×** |
+| Fixed 1,280-token request cap | 8 | 25 | **3.12×** |
+| Real 8,124-token requests (7,868 prompt + 256 decode), 43.218 GB equal KV budget | 46 | 46 | **1.00×**; 99.2% paged utilization |
+| KV memory for eight requests capped at 800 tokens | 3.758 GB | 0.734 GB | **80.5% less** when right-sized |
+| Mean physical-page utilization under mixed stress | — | 98.7% | little internal fragmentation |
+| Gathered attention latency, CPU microbenchmark | 6.435 ms | 7.694 ms | paged reference is **1.20× slower** |
+| Correctness suite | baseline | 6/6 tests pass | allocator, gather, masks, parity, reuse, static graph metadata |
+
+**Paged decode — RTX 6000 Ada, Llama-3.2-3B, 512-token context**
+
+| Batch | Gather + SDPA | Direct paged eager | Direct paged graph | Graph-only speedup | Graph tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 37.791 ms | 26.658 ms | 10.293 ms | **2.59×** | 97.2 |
+| 2 | 44.708 ms | 27.994 ms | 10.590 ms | **2.64×** | 188.9 |
+| 4 | 56.340 ms | 26.642 ms | 10.636 ms | **2.50×** | 376.1 |
+| 8 | 74.756 ms | 26.767 ms | 10.917 ms | **2.45×** | 732.8 |
+| 16 | 116.429 ms | 26.600 ms | 11.734 ms | **2.27×** | 1,363.6 |
+
+Interpretation:
+- The real RTX 6000 Ada result confirms the analytical prediction almost
+  exactly: after loading 6.560 GB of Llama weights, a 43.688 GB equal KV budget
+  holds **93 fixed 4,096-token rows or 464 mixed paged requests (4.99×)**.
+- **Paging improves capacity, not raw model math.** With the same 3.758 GB
+  physical pool, it converts unused tail space inside fixed 4,096-token rows
+  into pages available to other requests.
+- The benefit depends on request length: short requests produce the largest
+  gain; requests approaching `max_seq_len` converge toward contiguous-cache
+  capacity.
+- **Long-sequence finding:** at **8,124 / 8,192 tokens per request**, the equal
+  **43.218 GB** KV budget held **46 contiguous and 46 paged requests (1.00×)**,
+  with **99.2%** paged block utilization.
+- Internal waste is bounded to the unused tail of the final 16-token page
+  (at most 15 token slots per request), instead of thousands of unused slots in
+  a fixed row.
+- The current admission policy reserves each request's declared maximum length.
+  This prevents mid-generation page exhaustion but is more conservative than
+  production vLLM-style overcommit/preemption.
+- The gathered SDPA implementation proves correctness but copies K/V every
+  attention call, explaining the 20% CPU latency regression. Direct page-table
+  reads in `attention_paged_decode_triton` are required for the intended
+  throughput path.
+- With `--headroom-gb 0`, both real execution attempts OOMed *after* the KV
+  pools successfully reached their hard thresholds: contiguous needed another
+  548 MiB activation allocation and paged needed 2.72 GiB for its much larger
+  464-request prefill. This is an activation-workspace limit, not a KV paging
+  failure. Re-run with `--headroom-gb 6 --execute-threshold` to measure the
+  largest executable batches.
+- **Real GPU finding (6 GB headroom):** equal 37.581 GB KV budget held
+  **80 contiguous vs 398 paged requests (4.97×)**. Contiguous execution passed
+  in **28.635 s at 49.580 GB peak**; paged admitted 398 but its all-at-once
+  prefill OOMed requesting **2.33 GiB**, motivating chunked prefill.
+- **Paged CUDA-graph finding:** replaying the same direct paged Triton path is
+  **2.49× faster on average**, best **2.64× at batch 2**. Against gathered SDPA,
+  the complete improvement is **3.67×–9.92×** across batches 1–16.
+- Graph and eager logits had **100% top-1 agreement** with maximum absolute
+  logit difference **0.09375**.
+
+- **Deferred:** chunked prefill, then executable-threshold end-to-end throughput.
 
 ---
 
@@ -1563,7 +1677,8 @@ iterations/
   07_triton_attention.py        + Triton attention kernel (Section 14d)
   08_continuous_batching.py     + iteration-level scheduler (Section 15)
                                  ├─ branch A ─┐
-  09_paged_attention.py         + PagedAttention KV cache (Section 16) — built on 08
+  09_paged_attention.py      ✅ + original gathered PagedAttention reference
+                                (block allocator → block table → gather → SDPA)
                                  ├─ branch B ─┘
   10_radix_attention.py         + RadixAttention prefix sharing (Section 17) — built on 08, NOT 09
                                  │
