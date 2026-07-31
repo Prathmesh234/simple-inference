@@ -79,6 +79,7 @@ from ops.rope import rotate_half
 from sampling import sample
 from serving.paged_cuda_graph import PagedGraphDecoder
 from serving.paged_kv_cache import PagedKVCache, paged_attention_forward
+from serving.radix_cache import RadixCache
 from serving.request import Request, RequestState
 from serving.scheduler import Scheduler
 
@@ -111,6 +112,8 @@ class InferenceEngine:
         warmup: bool = True,
         use_cuda_graphs: bool | None = None,
         use_paged_attention: bool | None = None,
+        use_prefix_cache: bool = False,
+        prefix_cache_blocks: int | None = None,
     ):
         """
         Args:
@@ -133,6 +136,11 @@ class InferenceEngine:
             use_paged_attention: use page tables. Eager decode gathers into
                           SDPA; CUDA-graph decode reads pages directly from a
                           fixed GPU block-table buffer. Defaults to True.
+            use_prefix_cache: reuse complete paged KV blocks through a radix
+                          tree and prefill only the unmatched prompt suffix.
+            prefix_cache_blocks: maximum KV pages pinned by the radix cache.
+                          Defaults to the full pool; admission evicts cache
+                          leaves whenever live requests need those pages.
         """
         self.model = model
         self.cfg = model.cfg
@@ -149,6 +157,9 @@ class InferenceEngine:
         self.use_paged_attention = (
             True if use_paged_attention is None else use_paged_attention
         )
+        self.use_prefix_cache = use_prefix_cache
+        if self.use_prefix_cache and not self.use_paged_attention:
+            raise ValueError("prefix caching requires paged attention")
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got {block_size}")
 
@@ -187,6 +198,16 @@ class InferenceEngine:
                 dtype=self.dtype,
                 device=self.device,
             )
+
+        if self.use_prefix_cache:
+            cache_blocks = (
+                prefix_cache_blocks
+                if prefix_cache_blocks is not None
+                else self.num_kv_blocks
+            )
+            self.prefix_cache = RadixCache(self.kv, max_blocks=cache_blocks)
+        else:
+            self.prefix_cache = None
 
         # Lazily-captured per-batch-size decode graphs (captured on first use of
         # each bucket, or all at once in warmup()). None when graphs are off.
@@ -256,6 +277,8 @@ class InferenceEngine:
         self.scheduler.running.clear()
         self.scheduler.free_slots = list(range(self.max_running))
         self.kv.reset()
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
 
     @torch.no_grad()
     def warmup(self, num_seqs: int = 2, prompt_len: int = 8, decode_steps: int = 4) -> None:
@@ -315,9 +338,7 @@ class InferenceEngine:
             if self.use_paged_attention:
                 for req in evicted:
                     self.kv.release_request(req.id)
-                admitted = self.scheduler.admit(can_admit=self._can_reserve_pages)
-                for req in admitted:
-                    self.kv.reserve_request(req.id, req.prompt_len + req.max_new_tokens)
+                self.scheduler.admit(can_admit=self._reserve_pages)
             else:
                 self.scheduler.admit()
 
@@ -369,40 +390,86 @@ class InferenceEngine:
 
     def _prefill_batch(self, reqs: list[Request]) -> list[int]:
         """
-        Prefill a batch of requests in ONE forward pass (vLLM-style — there is no
-        single-request path). Prompts of different lengths are right-padded to the
-        batch max `Lmax`; every row attends only over its OWN slot with a causal
-        mask, so the per-row causal structure makes padding keys unreachable to
-        real query positions and padding-query outputs are simply discarded.
+        Prefill a batch of requests in ONE forward pass. Prefix-cache hits begin
+        at their first unmatched token; misses begin at zero. The suffixes are
+        right-padded to `Lmax`, and padding-query outputs are discarded.
 
         Each request's first token is sampled from its LAST REAL prompt position.
         """
         R = len(reqs)
-        lens = [r.prompt_len for r in reqs]
-        Lmax = max(lens)
+        starts = [r.cached_prefix_len for r in reqs]
+        suffix_lens = [r.prompt_len - start for r, start in zip(reqs, starts)]
+        if min(suffix_lens) < 1:
+            raise RuntimeError("prefix cache must leave at least one token for prefill")
+        total_lens = [r.prompt_len for r in reqs]
+        Lmax = max(suffix_lens)
         device = self.device
 
-        # Right-padded prompt ids (pad value 0 — its projections are harmless,
-        # they only ever land in masked/discarded positions).
+        # Right-pad only the uncached suffix. Cached complete pages already hold
+        # K/V for [0, start), so this forward computes [start, prompt_len).
         ids = torch.zeros(R, Lmax, dtype=torch.long, device=device)
-        for i, r in enumerate(reqs):
-            ids[i, : lens[i]] = torch.tensor(r.prompt_tokens, dtype=torch.long, device=device)
+        for row, (req, start, suffix_len) in enumerate(
+            zip(reqs, starts, suffix_lens)
+        ):
+            ids[row, :suffix_len] = torch.tensor(
+                req.prompt_tokens[start:],
+                dtype=torch.long,
+                device=device,
+            )
 
         slots = torch.tensor([r.slot for r in reqs], dtype=torch.long, device=device)
         h = self.model.embed(ids)  # (R, Lmax, hidden)
-        cos = self.model.rope_freqs.cos[:Lmax].to(self.dtype).view(1, Lmax, 1, self.head_dim)
-        sin = self.model.rope_freqs.sin[:Lmax].to(self.dtype).view(1, Lmax, 1, self.head_dim)
+        query_positions = (
+            torch.tensor(starts, dtype=torch.long, device=device).view(R, 1)
+            + torch.arange(Lmax, device=device).view(1, Lmax)
+        )
+        for row, suffix_len in enumerate(suffix_lens):
+            query_positions[row, suffix_len:] = starts[row]
+        cos = (
+            self.model.rope_freqs.cos[query_positions]
+            .to(self.dtype)
+            .view(R, Lmax, 1, self.head_dim)
+        )
+        sin = (
+            self.model.rope_freqs.sin[query_positions]
+            .to(self.dtype)
+            .view(R, Lmax, 1, self.head_dim)
+        )
 
         for layer in self.model.layers:
-            h = self._attn_prefill(h, layer, reqs, lens, slots, Lmax, cos, sin, R)
+            h = self._attn_prefill(
+                h,
+                layer,
+                reqs,
+                starts,
+                suffix_lens,
+                total_lens,
+                slots,
+                Lmax,
+                query_positions,
+                cos,
+                sin,
+                R,
+            )
             h = h + layer.mlp(layer.mlp_norm(h))
 
-        # Gather each request's last real position, then norm+head only there.
-        last_idx = torch.tensor([l - 1 for l in lens], dtype=torch.long, device=device)
+        # Gather each request's last real suffix position.
+        last_idx = torch.tensor(
+            [length - 1 for length in suffix_lens],
+            dtype=torch.long,
+            device=device,
+        )
         h_last = h[torch.arange(R, device=device), last_idx]   # (R, hidden)
         h_last = self.model.norm(h_last.unsqueeze(1))          # (R, 1, hidden)
         logits = self.model.head(h_last)[:, -1, :]             # (R, vocab)
         toks = self._sample(logits).tolist()
+
+        if self.prefix_cache is not None:
+            for req in reqs:
+                self.prefix_cache.insert(
+                    req.prompt_tokens,
+                    self.kv.block_tables[req.id],
+                )
 
         for req, tok in zip(reqs, toks):
             req.pos = req.prompt_len                           # next write goes here
@@ -412,7 +479,21 @@ class InferenceEngine:
             req.state = RequestState.FINISHED if req.should_finish() else RequestState.DECODE
         return toks
 
-    def _attn_prefill(self, h, layer, reqs, lens, slots, Lmax, cos, sin, R) -> torch.Tensor:
+    def _attn_prefill(
+        self,
+        h,
+        layer,
+        reqs,
+        starts,
+        suffix_lens,
+        total_lens,
+        slots,
+        Lmax,
+        query_positions,
+        cos,
+        sin,
+        R,
+    ) -> torch.Tensor:
         attn = layer.attn
         li = attn.layer_idx
         x = layer.attn_norm(h)
@@ -427,22 +508,30 @@ class InferenceEngine:
             # Padding never gets a page-table entry: each request writes only
             # its real prompt positions, then gathers its own logical prefix.
             for row, req in enumerate(reqs):
-                real_length = lens[row]
+                real_length = suffix_lens[row]
                 self.kv.append(
                     li,
                     req.id,
-                    0,
+                    starts[row],
                     k[row, :real_length].transpose(0, 1).contiguous(),
                     v[row, :real_length].transpose(0, 1).contiguous(),
                 )
             K, V = self.kv.gather_batch(
-                li, [req.id for req in reqs], lens, pad_to=Lmax
+                li,
+                [req.id for req in reqs],
+                total_lens,
+                pad_to=max(total_lens),
             )
-            query_positions = torch.arange(Lmax, device=self.device).view(1, Lmax).expand(R, -1)
-            key_lengths = torch.tensor(lens, dtype=torch.long, device=self.device)
+            key_lengths = torch.tensor(
+                total_lens,
+                dtype=torch.long,
+                device=self.device,
+            )
             out = paged_attention_forward(qT, K, V, query_positions, key_lengths, self.kv_groups)
             out = out.transpose(1, 2)
         else:
+            if any(starts):
+                raise RuntimeError("cached-prefix prefill requires paged attention")
             # Write each row's K/V into its slot at columns [0, Lmax).
             self.kv.k_cache[li][slots, :, :Lmax, :] = k.permute(0, 2, 1, 3)
             self.kv.v_cache[li][slots, :, :Lmax, :] = v.permute(0, 2, 1, 3)
@@ -600,6 +689,35 @@ class InferenceEngine:
             top_p=self.top_p,
         )
 
-    def _can_reserve_pages(self, req: Request) -> bool:
-        """Admission callback: request capacity must fit the paged pool."""
-        return self.kv.can_reserve(req.id, req.prompt_len + req.max_new_tokens)
+    def _reserve_pages(self, req: Request) -> bool:
+        """Admission callback: match, reclaim cache pages, then reserve capacity."""
+        max_tokens = req.prompt_len + req.max_new_tokens
+        shared_block_ids: list[int] = []
+        cached_tokens = 0
+
+        if self.prefix_cache is not None:
+            match = self.prefix_cache.match(req.prompt_tokens)
+            shared_block_ids = match.block_ids
+            cached_tokens = match.token_count
+            required_blocks = (
+                self.kv.blocks_for_tokens(max_tokens) - len(shared_block_ids)
+            )
+            if not self.prefix_cache.evict_until_available(
+                required_blocks,
+                protected_block_ids=set(shared_block_ids),
+            ):
+                return False
+        elif not self.kv.can_reserve(req.id, max_tokens):
+            return False
+
+        try:
+            self.kv.reserve_request(
+                req.id,
+                max_tokens,
+                shared_block_ids=shared_block_ids,
+                cached_tokens=cached_tokens,
+            )
+        except MemoryError:
+            return False
+        req.cached_prefix_len = cached_tokens
+        return True
