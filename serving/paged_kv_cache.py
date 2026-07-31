@@ -84,22 +84,61 @@ class PagedKVCache:
             raise ValueError(f"token_count must be non-negative, got {token_count}")
         return math.ceil(token_count / self.block_size)
 
-    def can_reserve(self, request_id: int, max_tokens: int) -> bool:
-        """Whether this request's declared maximum sequence length fits."""
-        return self.allocator.can_reserve(request_id, self.blocks_for_tokens(max_tokens))
+    def can_reserve(
+        self,
+        request_id: int,
+        max_tokens: int,
+        shared_blocks: int = 0,
+    ) -> bool:
+        """Whether a request fits after reusing `shared_blocks` cached pages."""
+        required = self.blocks_for_tokens(max_tokens)
+        if not 0 <= shared_blocks <= required:
+            raise ValueError(
+                f"shared_blocks must be in [0, {required}], got {shared_blocks}"
+            )
+        return self.allocator.can_reserve(request_id, required - shared_blocks)
 
-    def reserve_request(self, request_id: int, max_tokens: int) -> None:
+    def reserve_request(
+        self,
+        request_id: int,
+        max_tokens: int,
+        *,
+        shared_block_ids: list[int] | None = None,
+        cached_tokens: int = 0,
+    ) -> None:
         """
-        Reserve eventual capacity, without allocating physical pages yet.
+        Reserve eventual capacity and attach any immutable cached prefix pages.
 
         Reserving at admission prevents a request from reaching a page boundary
         later and deadlocking all active requests because every physical block
         has already been consumed by other growing sequences.
         """
+        shared = list(shared_block_ids or [])
+        if cached_tokens != len(shared) * self.block_size:
+            raise ValueError(
+                "cached_tokens must describe complete shared pages: "
+                f"{cached_tokens} != {len(shared)} * {self.block_size}"
+            )
+        if cached_tokens > max_tokens:
+            raise ValueError(
+                f"cached prefix {cached_tokens} exceeds request capacity {max_tokens}"
+            )
         block_count = self.blocks_for_tokens(max_tokens)
-        self.allocator.reserve(request_id, block_count)
+        if len(shared) > block_count:
+            raise ValueError(
+                f"{len(shared)} shared blocks exceed request capacity {block_count}"
+            )
+
+        self.allocator.reserve(request_id, block_count - len(shared))
         self.block_tables[request_id] = []
-        self.lengths[request_id] = 0
+        self.lengths[request_id] = cached_tokens
+        try:
+            for block_id in shared:
+                self.allocator.incref(request_id, block_id)
+                self.block_tables[request_id].append(block_id)
+        except Exception:
+            self.release_request(request_id)
+            raise
 
     def append(
         self,
