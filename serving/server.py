@@ -80,6 +80,11 @@ DEFAULT_MAX_NEW = int(os.environ.get("SERVE_DEFAULT_MAX_NEW", "128"))
 USE_PAGED_CUDA_GRAPHS = os.environ.get(
     "SERVE_USE_CUDA_GRAPHS", "true"
 ).lower() in ("1", "true", "yes", "on")
+USE_PREFIX_CACHE = os.environ.get(
+    "SERVE_USE_PREFIX_CACHE", "true"
+).lower() in ("1", "true", "yes", "on")
+_PCB = os.environ.get("SERVE_PREFIX_CACHE_BLOCKS", "")
+PREFIX_CACHE_BLOCKS = int(_PCB) if _PCB else None
 DTYPE = torch.bfloat16
 
 
@@ -234,6 +239,8 @@ def _load() -> None:
         warmup=True,
         use_cuda_graphs=USE_PAGED_CUDA_GRAPHS,
         use_paged_attention=True,
+        use_prefix_cache=USE_PREFIX_CACHE,
+        prefix_cache_blocks=PREFIX_CACHE_BLOCKS,
     )
     state.worker = _Worker(state.engine)
     state.worker.start()
@@ -295,6 +302,7 @@ def health() -> dict:
         "max_seq_len": MAX_SEQ_LEN,
         "paged_attention": eng.use_paged_attention if ready else True,
         "cuda_graphs": eng.graph_decoder is not None if ready else USE_PAGED_CUDA_GRAPHS,
+        "prefix_cache": eng.prefix_cache.stats() if ready and eng.prefix_cache else None,
         "paged_block_size": PAGED_BLOCK_SIZE,
         "kv_blocks": eng.num_kv_blocks if ready else NUM_KV_BLOCKS,
         "sampling": {"temperature": TEMPERATURE, "top_k": TOP_K, "top_p": TOP_P},
