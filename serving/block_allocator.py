@@ -29,6 +29,7 @@ class BlockAllocator:
         self._free_blocks = list(range(num_blocks))
         heapq.heapify(self._free_blocks)
         self._ref_counts = [0] * num_blocks
+        # Remaining not-yet-allocated blocks promised to each owner.
         self._reservations: dict[int, int] = {}
         self._owned_blocks: dict[int, set[int]] = {}
 
@@ -39,13 +40,13 @@ class BlockAllocator:
 
     @property
     def reserved_blocks(self) -> int:
-        """Capacity promised to live requests, including not-yet-written pages."""
+        """Unallocated physical blocks promised to live owners."""
         return sum(self._reservations.values())
 
     @property
     def available_reservation_blocks(self) -> int:
         """Capacity that can still be promised to a newly admitted request."""
-        return self.num_blocks - self.reserved_blocks
+        return self.free_blocks - self.reserved_blocks
 
     def can_reserve(self, request_id: int, block_count: int) -> bool:
         """Whether a new request can reserve `block_count` pages."""
@@ -55,10 +56,11 @@ class BlockAllocator:
 
     def reserve(self, request_id: int, block_count: int) -> None:
         """
-        Promise a request enough eventual pages to finish.
+        Promise an owner enough additional physical pages to finish.
 
         This does not remove a physical block from the free list. `allocate()`
-        does that lazily when the request first writes a page.
+        does that lazily and consumes one promised block. Shared blocks added
+        through `incref()` need no reservation because they already exist.
         """
         if block_count < 0:
             raise ValueError(f"block_count must be non-negative, got {block_count}")
@@ -74,18 +76,17 @@ class BlockAllocator:
         """Give a reserved request its next physical block."""
         if request_id not in self._reservations:
             raise KeyError(f"request {request_id} has no block reservation")
-        owned = self._owned_blocks[request_id]
-        if len(owned) >= self._reservations[request_id]:
+        if self._reservations[request_id] <= 0:
             raise MemoryError(
-                f"request {request_id} exhausted its {self._reservations[request_id]} "
-                "reserved KV blocks"
+                f"request {request_id} exhausted its reserved KV blocks"
             )
         if not self._free_blocks:
             raise RuntimeError("reserved KV capacity invariant violated: no free physical blocks")
 
         block_id = heapq.heappop(self._free_blocks)
         self._ref_counts[block_id] = 1
-        owned.add(block_id)
+        self._owned_blocks[request_id].add(block_id)
+        self._reservations[request_id] -= 1
         return block_id
 
     def incref(self, request_id: int, block_id: int) -> None:
@@ -102,8 +103,6 @@ class BlockAllocator:
         owned = self._owned_blocks[request_id]
         if block_id in owned:
             raise ValueError(f"request {request_id} already references block {block_id}")
-        if len(owned) >= self._reservations[request_id]:
-            raise MemoryError(f"request {request_id} has no reserved block capacity left")
         if self._ref_counts[block_id] == 0:
             raise ValueError(f"cannot share unallocated block {block_id}")
         self._ref_counts[block_id] += 1
