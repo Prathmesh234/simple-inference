@@ -720,15 +720,15 @@ hidden killer in naive KV caches, the gather-based attention pattern.
 | Gathered attention latency, CPU microbenchmark | 6.435 ms | 7.694 ms | paged reference is **1.20× slower** |
 | Correctness suite | baseline | 6/6 tests pass | allocator, gather, masks, parity, reuse, static graph metadata |
 
-**Paged decode — RTX 6000 Ada, Llama-3.2-3B, 512-token context**
+**Paged decode — RTX 6000 Ada, Llama-3.2-3B, 512-token English context**
 
 | Batch | Gather + SDPA | Direct paged eager | Direct paged graph | Graph-only speedup | Graph tok/s |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 37.791 ms | 26.658 ms | 10.293 ms | **2.59×** | 97.2 |
-| 2 | 44.708 ms | 27.994 ms | 10.590 ms | **2.64×** | 188.9 |
-| 4 | 56.340 ms | 26.642 ms | 10.636 ms | **2.50×** | 376.1 |
-| 8 | 74.756 ms | 26.767 ms | 10.917 ms | **2.45×** | 732.8 |
-| 16 | 116.429 ms | 26.600 ms | 11.734 ms | **2.27×** | 1,363.6 |
+| 1 | 37.340 ms | 26.936 ms | 11.474 ms | **2.35×** | 87.2 |
+| 2 | 48.973 ms | 31.093 ms | 11.909 ms | **2.61×** | 167.9 |
+| 4 | 61.903 ms | 30.230 ms | 11.927 ms | **2.53×** | 335.4 |
+| 8 | 85.388 ms | 29.405 ms | 12.223 ms | **2.41×** | 654.5 |
+| 16 | 137.599 ms | 30.051 ms | 13.039 ms | **2.30×** | 1,227.1 |
 
 Interpretation:
 - The real RTX 6000 Ada result confirms the analytical prediction almost
@@ -764,23 +764,22 @@ Interpretation:
   in **28.635 s at 49.580 GB peak**; paged admitted 398 but its all-at-once
   prefill OOMed requesting **2.33 GiB**, motivating chunked prefill.
 - **Paged CUDA-graph finding:** replaying the same direct paged Triton path is
-  **2.49× faster on average**, best **2.64× at batch 2**. Against gathered SDPA,
-  the complete improvement is **3.67×–9.92×** across batches 1–16.
+  **2.44× faster on average**, best **2.61× at batch 2**. Against gathered SDPA,
+  the complete improvement is **3.25×–10.55×** across batches 1–16.
 - Graph and eager logits had **100% top-1 agreement** with maximum absolute
-  logit difference **0.09375**.
+  logit difference **0.125**.
 
 - **Deferred:** chunked prefill, then executable-threshold end-to-end throughput.
 
 ---
 
-## Section 17 — RadixAttention / Prefix Caching  *(SGLang's signature optimization — independent)*
+## ✅ Section 17 — RadixAttention / Prefix Caching  *(SGLang's signature optimization)*
 
-**Builds on:** Section 15 (continuous batching) **directly** — does *not* require
-PagedAttention. We use a simple per-prefix KV store as a sidecar to the Section 11
-contiguous KV cache. This isolates the *prefix-sharing* idea from the *paging* idea
-so each can be benchmarked on its own.
+**Builds on:** Sections 15–16. Complete prompt pages are shared directly from
+the paged KV pool through a block-aligned radix tree.
 
-**Files:** `serving/radix_cache.py`, integrate with `serving/scheduler.py`
+**Files:** `serving/radix_cache.py`, `serving/engine.py`,
+`serving/paged_kv_cache.py`, `serving/block_allocator.py`
 
 **Problem it solves**
 Real workloads have massive prefix overlap:
@@ -792,63 +791,20 @@ Without sharing: every request recomputes K/V for the same tokens, wastes both
 compute (prefill) and memory (duplicate stored K/V). RadixAttention shares stored
 K/V across requests via a radix tree keyed by token sequences.
 
-**Solution: radix tree over token sequences (cache-aside the KV store)**
-- Each tree node stores: (token sequence segment, K/V tensors for those tokens, ref_count)
-- `match(tokens)` walks the tree to find the longest cached prefix → returns
-  cached K/V (per layer) + remaining tokens to compute
-- `insert(tokens, k_per_layer, v_per_layer)` adds a new path; shared segments
-  bump ref_count so they aren't evicted while in use
-- LRU eviction when total cached tokens exceed a configured budget; pinned
-  (ref_count > 0) segments are skipped
+Implementation: longest-prefix lookup reuses immutable physical KV pages with
+ref-counting, prefills only the unmatched suffix, and evicts LRU leaves when
+live requests need capacity. `SERVE_USE_PREFIX_CACHE=true` enables it.
 
-```python
-class RadixNode:
-    children:   dict[tuple[int,...], RadixNode]
-    k_cache:    torch.Tensor   # (n_layers, seg_len, n_kv_heads, head_dim)
-    v_cache:    torch.Tensor   # same shape
-    ref_count:  int
-    last_used:  int            # for LRU
+**RTX 6000 Ada TTFT — Llama-3.2-3B, English prompts**
 
-class RadixCache:
-    root:         RadixNode
-    total_tokens: int          # current cached size, capped at a budget
-    def match(tokens) -> (cached_k, cached_v, remaining_tokens)
-    def insert(tokens, k_per_layer, v_per_layer): ...
-    def release(ref_handle): ...
-    def evict_lru(target_tokens): ...
-```
+| Context | Cache miss | 50% hit | Near-full hit |
+|---:|---:|---:|---:|
+| 1,024 | 110.0 ms / **1.00×** | 74.3 ms / **1.46×** | 48.5 ms / **2.25×** |
+| 2,048 | 307.0 ms / **1.00×** | 159.8 ms / **1.92×** | 44.9 ms / **6.85×** |
+| 4,096 | 1,004.4 ms / **1.00×** | 508.9 ms / **1.97×** | 50.1 ms / **20.07×** |
 
-Scheduler integration: when admitting a request, first call
-`radix.match(prompt_tokens)` →
-1. The matched K/V is copied into the request's contiguous KV cache slot at positions [0, matched_len)
-2. Prefill only runs on the remaining tail tokens → skipped compute
-3. On request completion, optionally `insert()` the request's final K/V into the radix
-4. The matched segment's ref_count is bumped while the request is live
-
-**Steps**
-- Implement radix tree with `match` / `insert` / `release` / `evict_lru`
-- Store K/V per node as one tensor per layer (or one big stacked tensor across layers)
-- Modify scheduler: prefix-match before admitting, only prefill the tail tokens
-- Verify correctness: shared-prefix requests produce identical logits to non-shared baseline
-- Watch for: cache invalidation on eviction must not happen while a request is still using a segment (ref_count guards this)
-
-**Trade-off vs PagedAttention version**
-Without paged blocks the radix cache stores K/V as fixed contiguous segments per
-node, so memory layout is less efficient — but the logic is simpler and the
-prefix-sharing win is fully measurable. After Section 17, integrating with the
-Section 16 block pool is straightforward (replace per-node K/V tensors with
-per-node block lists) and is the natural follow-up.
-
-**Benchmark workload (add as #8):**
-64 requests, all sharing a 256-token "system prompt", each with a unique 64-token user query, 128 decode tokens.
-
-**Expected win:**
-- 2-5× throughput on shared-prefix workloads
-- TTFT drops to near-zero for cache hits (no prefill cost on the shared portion)
-- This is what makes SGLang dominate in agent/chat workloads
-
-**Learned:** radix trees, ref-counted memory, LRU eviction with pinning, why
-shared compute is the highest-leverage optimization for real workloads.
+Cache misses add effectively no overhead; near-full hits keep TTFT near
+**45–50 ms** as context grows from 1K to 4K tokens. Correctness: **9/9 tests**.
 
 ---
 
