@@ -58,6 +58,7 @@ class Request:
     state: RequestState = RequestState.WAITING
     slot: int | None = None          # admission slot; a KV row only in contiguous mode
     pos: int = 0                     # absolute index of the NEXT token to write
+    cached_prefix_len: int = 0       # complete prompt tokens reused from radix cache
     generated: list[int] = field(default_factory=list)
     eos_hit: bool = False
 
