@@ -30,12 +30,37 @@ from loader import WeightLoader
 from model.llama import LlamaModel
 from serving.engine import InferenceEngine
 from serving.request import Request, RequestState
+from tokenizer import Tokenizer
 
 
 MODEL_ID = "meta-llama/Llama-3.2-3B"
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 RESULTS_FILE = Path(__file__).with_name("paged_cudagraph_results.json")
+LOGIT_RTOL = 0.05
+LOGIT_ATOL = 0.15
+ENGLISH_PROMPTS = (
+    (
+        "A small inference engine processes requests in two stages. During "
+        "prefill it reads the prompt and writes keys and values into the cache. "
+        "During decode it generates one token at a time while reusing that cache."
+    ),
+    (
+        "CUDA graphs reduce launch overhead by recording a fixed sequence of GPU "
+        "operations once and replaying it later. Static buffers keep their memory "
+        "addresses while token, position, and page-table values change in place."
+    ),
+    (
+        "Paged attention divides the key-value cache into fixed-size physical "
+        "blocks. Each request owns a block table that maps logical token positions "
+        "to those blocks, allowing short requests to avoid reserving long rows."
+    ),
+    (
+        "Continuous batching rebuilds the active batch after every decode step. "
+        "Finished requests release their capacity immediately, and waiting requests "
+        "can begin without waiting for every sequence in the previous batch."
+    ),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +91,24 @@ def build_model(model_id: str) -> LlamaModel:
     return model.eval()
 
 
+def build_english_prompts(
+    tokenizer: Tokenizer,
+    batch_size: int,
+    context_len: int,
+) -> list[list[int]]:
+    """Create distinct tokenized English prompts with exactly `context_len` tokens."""
+    prompts: list[list[int]] = []
+    for row in range(batch_size):
+        text = ENGLISH_PROMPTS[row % len(ENGLISH_PROMPTS)]
+        body = tokenizer.encode(text, add_bos=False)
+        if not body:
+            raise RuntimeError("English benchmark prompt produced no tokens")
+        needed = context_len - 1
+        repeated = (body * ((needed + len(body) - 1) // len(body)))[:needed]
+        prompts.append([tokenizer.bos_id, *repeated])
+    return prompts
+
+
 def build_engine(
     model: LlamaModel,
     *,
@@ -88,18 +131,17 @@ def build_engine(
 
 def make_steady_requests(
     engine: InferenceEngine,
-    batch_size: int,
-    context_len: int,
+    prompts: list[list[int]],
 ) -> list[Request]:
     engine.reset()
-    vocab = engine.cfg.vocab_size
-    prompt = [engine.cfg.bos_token_id] + [
-        1 + ((position * 17) % (vocab - 1))
-        for position in range(context_len - 1)
-    ]
+    if not prompts:
+        raise ValueError("prompts must not be empty")
+    context_len = len(prompts[0])
+    if any(len(prompt) != context_len for prompt in prompts):
+        raise ValueError("all benchmark prompts must have the same context length")
     max_new_tokens = engine.max_seq_len - context_len
-    for _ in range(batch_size):
-        engine.add_request(list(prompt), max_new_tokens=max_new_tokens)
+    for prompt in prompts:
+        engine.add_request(prompt, max_new_tokens=max_new_tokens)
 
     engine.step()
     running = [
@@ -107,9 +149,9 @@ def make_steady_requests(
         for request in engine.scheduler.running
         if request.state is RequestState.DECODE
     ]
-    if len(running) != batch_size:
+    if len(running) != len(prompts):
         raise RuntimeError(
-            f"expected {batch_size} decode requests, found {len(running)}"
+            f"expected {len(prompts)} decode requests, found {len(running)}"
         )
     return running
 
@@ -174,6 +216,7 @@ def main() -> None:
 
     max_seq_len = args.context_len + args.decode_room
     max_running = max(args.batch_sizes)
+    tokenizer = Tokenizer.from_pretrained(args.model_id)
     model = build_model(args.model_id)
 
     print("Building paged eager engine...")
@@ -206,8 +249,9 @@ def main() -> None:
 
     rows: list[dict[str, float | int]] = []
     for batch_size in args.batch_sizes:
-        eager_requests = make_steady_requests(eager, batch_size, args.context_len)
-        graph_requests = make_steady_requests(graph, batch_size, args.context_len)
+        prompts = build_english_prompts(tokenizer, batch_size, args.context_len)
+        eager_requests = make_steady_requests(eager, prompts)
+        graph_requests = make_steady_requests(graph, prompts)
 
         expected = eager_logits(eager, eager_requests)
         direct = direct_eager_logits(graph, graph_requests)
@@ -215,21 +259,29 @@ def main() -> None:
         direct_diff = float((expected.float() - direct.float()).abs().max().item())
         graph_diff = float((expected.float() - actual.float()).abs().max().item())
         max_abs_diff = max(direct_diff, graph_diff)
-        top1_agreement = float(
+        direct_top1_agreement = float(
+            (expected.argmax(dim=-1) == direct.argmax(dim=-1)).float().mean().item()
+        )
+        graph_top1_agreement = float(
             (expected.argmax(dim=-1) == actual.argmax(dim=-1)).float().mean().item()
         )
+        top1_agreement = min(direct_top1_agreement, graph_top1_agreement)
         torch.testing.assert_close(
             direct.float(),
             expected.float(),
-            rtol=0.05,
-            atol=0.10,
+            rtol=LOGIT_RTOL,
+            atol=LOGIT_ATOL,
         )
         torch.testing.assert_close(
             actual.float(),
             expected.float(),
-            rtol=0.05,
-            atol=0.10,
+            rtol=LOGIT_RTOL,
+            atol=LOGIT_ATOL,
         )
+        if top1_agreement < 1.0:
+            raise AssertionError(
+                "direct/graph decode changed at least one greedy next token"
+            )
 
         gathered_ms = benchmark_ms(
             lambda: eager_logits(eager, eager_requests),
@@ -278,6 +330,7 @@ def main() -> None:
         "context_len": args.context_len,
         "max_seq_len": max_seq_len,
         "block_size": args.block_size,
+        "prompt_source": "tokenized English benchmark prompts",
         "rows": rows,
     }
     args.results_file.write_text(json.dumps(result, indent=2) + "\n")
