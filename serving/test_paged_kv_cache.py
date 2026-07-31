@@ -17,6 +17,7 @@ from serving.block_allocator import BlockAllocator
 from serving.engine import InferenceEngine
 from serving.paged_cuda_graph import PagedDecodeBuffers, PagedGraphDecoder
 from serving.paged_kv_cache import PagedKVCache, paged_attention_forward
+from serving.radix_cache import RadixCache
 
 
 class BlockAllocatorTest(unittest.TestCase):
@@ -83,6 +84,42 @@ class PagedKVCacheTest(unittest.TestCase):
         self.assertEqual(self.cache.allocator.free_blocks, 4)
         self.cache.append(layer_idx=0, request_id=11, start_pos=0, k=values[:, :2], v=values[:, :2])
         self.assertEqual(self.cache.block_tables[11], [0])
+
+
+class RadixCacheTest(unittest.TestCase):
+    def test_match_shares_complete_pages_and_cache_clear_is_refcount_safe(self) -> None:
+        cache = PagedKVCache(
+            n_layers=1,
+            num_blocks=6,
+            block_size=2,
+            n_heads_kv=1,
+            head_dim=2,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        radix = RadixCache(cache, max_blocks=4)
+        cache.reserve_request(request_id=1, max_tokens=4)
+        values = torch.arange(8, dtype=torch.float32).view(1, 4, 2)
+        cache.append(0, 1, 0, values, values)
+        radix.insert([1, 2, 3, 4], cache.block_tables[1])
+
+        cache.release_request(1)
+        self.assertEqual(cache.allocator.free_blocks, 4)
+
+        match = radix.match([1, 2, 3, 4, 5])
+        self.assertEqual(match.token_count, 4)
+        self.assertEqual(len(match.block_ids), 2)
+        cache.reserve_request(
+            request_id=2,
+            max_tokens=6,
+            shared_block_ids=match.block_ids,
+            cached_tokens=match.token_count,
+        )
+
+        radix.clear()
+        self.assertEqual(cache.allocator.free_blocks, 4)
+        cache.release_request(2)
+        self.assertEqual(cache.allocator.free_blocks, 6)
 
 
 class PagedAttentionTest(unittest.TestCase):
@@ -192,6 +229,39 @@ class PagedEngineTest(unittest.TestCase):
         engine.step()
         self.assertNotIn(second, engine.scheduler.waiting)
         self.assertEqual(second.state.name, "FINISHED")
+
+    def test_prefix_cache_reuses_pages_and_matches_uncached_output(self) -> None:
+        model = self._tiny_model()
+        common = dict(
+            model=model,
+            max_running=1,
+            max_seq_len=8,
+            block_size=2,
+            num_kv_blocks=8,
+            eos_id=-1,
+            temperature=0.0,
+            warmup=False,
+            use_cuda_graphs=False,
+            use_paged_attention=True,
+        )
+        cached = InferenceEngine(
+            **common,
+            use_prefix_cache=True,
+            prefix_cache_blocks=4,
+        )
+        baseline = InferenceEngine(**common)
+
+        cached.add_request([1, 4, 6, 8, 9], max_new_tokens=2)
+        cached.run()
+        reused = cached.add_request([1, 4, 6, 8, 10], max_new_tokens=2)
+        cached.run()
+
+        expected = baseline.add_request([1, 4, 6, 8, 10], max_new_tokens=2)
+        baseline.run()
+
+        self.assertEqual(reused.cached_prefix_len, 4)
+        self.assertEqual(reused.generated, expected.generated)
+        self.assertEqual(cached.prefix_cache.stats()["matched_tokens"], 4)
 
     def test_graph_metadata_updates_in_place_and_pads_with_scratch(self) -> None:
         model = self._tiny_model()
