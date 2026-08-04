@@ -657,7 +657,7 @@ Same as #6 but ramp concurrent requests until OOM. Report **max concurrency**.
 **Learned:** OS-style paging for tensors, block tables, why fragmentation is the
 hidden killer in naive KV caches, the gather-based attention pattern.
 
-**Implemented (gathered reference path)**
+**Implemented (direct paged decode with gathered reference fallback)**
 - `serving/block_allocator.py` owns a fixed physical-page pool, request capacity
   reservations, free-list allocation, and ref-count primitives for future prefix
   sharing.
@@ -665,16 +665,16 @@ hidden killer in naive KV caches, the gather-based attention pattern.
   `(layer, physical_block, kv_head, block_offset, head_dim)` and translates each
   request's logical positions through its `block_tables[request_id]`.
 - `serving/engine.py` reserves the declared request capacity at admission,
-  allocates physical blocks only as prefill/decode writes reach them, gathers
-  logical K/V prefixes, and applies the per-request causal/length mask in SDPA.
-  Eager decode uses the gathered reference path.
-- `serving/paged_cuda_graph.py` combines paging with decode CUDA graphs:
-  fixed-size token, position, RoPE, and block-table buffers are updated in
-  place before replay; page allocation remains outside capture; padding rows
-  write to one reserved scratch page.
+  coordinates prefix lookup, unmatched-suffix prefill, and decode.
+- `serving/prefill.py` gathers logical K/V prefixes and applies the per-request
+  causal/length mask for variable-length prompt suffixes.
+- `serving/paged_decoder.py` owns one direct page-table Triton decode forward.
+  Graph-off launches it eagerly; graph-on captures and replays the exact same
+  forward. Fixed token, position, RoPE, and block-table buffers are updated in
+  place; padding rows write to one reserved scratch page.
 - `attention_paged_decode_triton` reads the fixed block-table buffer directly
   and performs online-softmax attention over physical pages, eliminating the
-  gathered K/V temporary inside graph replay.
+  gathered K/V temporary in both eager and graph serving modes.
 - `serving/test_paged_kv_cache.py` is CPU-only coverage for allocator lifetime,
   cross-page write/gather order, gathered-attention masking, engine parity, and
   page reuse. Run `uv run python -m unittest serving.test_paged_kv_cache -v`.
@@ -930,6 +930,46 @@ Re-run workloads #6-#9 with graphs on/off. Decode-heavy workloads see the larges
 **Expected win:**
 - 1.5-2× decode throughput at batch ≤ 8 (where launch overhead dominates)
 - Diminishing returns at large batches (compute dominates launch overhead)
+
+### Integrated bottom-to-top megabenchmark  `IMPLEMENTED`
+
+`benchmarks/megabenchmark/` runs every completed engine stage in a fresh
+subprocess with explicit import-time flags:
+
+`no KV -> static KV -> Triton -> autotuning -> fused transpose -> continuous
+batching -> contiguous graphs -> gathered paging -> direct paged Triton ->
+paged graphs -> radix prefix cache`
+
+The quick/full/stress profiles preserve per-request token outputs and collect
+TTFT, TPOT, end-to-end latency, prefill/decode throughput, request throughput,
+step traces, allocated/reserved VRAM, physical KV bytes, allocator/cache stats,
+backend/graph state, and exact/common-prefix output parity. Results are emitted
+as raw state JSON, combined JSON, flat CSV, console tables, and `report.md` for
+copying back into this plan.
+
+The prefix-cache workload uses 16 concurrent users, a 2,048-token shared system
+prompt, and 512-token user-specific tails. It measures the seeded cache-hit
+batch, forces leaf-LRU eviction with an unrelated prompt, reruns the same users
+as misses, and verifies recomputed output parity.
+
+Run the complete implemented stack with:
+
+```bash
+uv run python -m benchmarks.megabenchmark.run --profile full
+```
+
+**Full-run result — RTX 6000 Ada (2026-08-04):**
+- Static KV caching made single-request generation **2.75× faster** than
+  recomputing the full sequence (64.4 vs 23.5 output tok/s).
+- Direct paged Triton was **4.35× faster** than gathered paging on the
+  decode-heavy batch; CUDA graphs added another **1.66×**, reaching
+  **1,249.8 output tok/s** at **11.61 ms p50 TPOT** and **8.25 GB peak VRAM**.
+- For 16 users sharing 2,048 system tokens plus 512-token tails, prefix hits
+  took **1,452 ms** versus **8,331 ms** after eviction: recomputation was
+  **5.74× slower**, with hit/miss output parity passing.
+- Follow-up: many cross-engine greedy outputs were not exactly identical, and
+  the preserved contiguous CUDA-graph state hit an illegal memory access on
+  the decode-heavy workload; both require correctness investigation.
 
 **Learned:** CPU vs GPU as the bottleneck for small-batch decode, graph
 capture/replay semantics, why static shapes + static memory are the cost of admission.

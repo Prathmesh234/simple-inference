@@ -16,3 +16,5 @@ profiling/**/*.nsys-rep
 profiling/**/*.ncu-rep
 # Per-run generation metrics
 metrics/
+# Megabenchmark JSON, logs, reports, and compiler caches
+benchmarks/megabenchmark/results/
