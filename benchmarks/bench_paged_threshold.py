@@ -47,6 +47,9 @@ import env_loader  # noqa: F401
 import torch
 
 from config import ModelConfig
+from iterations.inference_01_contiguous_eager.engine import (
+    InferenceEngine as ContiguousInferenceEngine,
+)
 from loader import WeightLoader
 from model.kv_cache import KVCache
 from model.llama import LlamaModel
@@ -276,18 +279,23 @@ def execute_engine(
     engine = None
     phase = "engine_initialization"
     try:
-        engine = InferenceEngine(
+        common = dict(
             model=model,
             max_running=max_running,
             max_seq_len=max_seq_len,
-            block_size=block_size,
-            num_kv_blocks=num_kv_blocks,
             token_budget=sum(request.prompt_len for request in requests),
             temperature=0.0,
             warmup=False,
-            use_cuda_graphs=False,
-            use_paged_attention=paged,
         )
+        if paged:
+            engine = InferenceEngine(
+                **common,
+                block_size=block_size,
+                num_kv_blocks=num_kv_blocks,
+                use_cuda_graphs=False,
+            )
+        else:
+            engine = ContiguousInferenceEngine(**common)
         for index, request in enumerate(requests):
             engine.add_request(
                 make_tokens(request.prompt_len, cfg, index),

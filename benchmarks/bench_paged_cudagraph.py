@@ -115,6 +115,7 @@ def build_engine(
     max_running: int,
     max_seq_len: int,
     block_size: int,
+    use_triton: bool,
     use_cuda_graphs: bool,
 ) -> InferenceEngine:
     return InferenceEngine(
@@ -124,8 +125,8 @@ def build_engine(
         block_size=block_size,
         temperature=0.0,
         warmup=False,
+        use_triton=use_triton,
         use_cuda_graphs=use_cuda_graphs,
-        use_paged_attention=True,
     )
 
 
@@ -157,48 +158,15 @@ def make_steady_requests(
 
 
 @torch.no_grad()
-def eager_logits(engine: InferenceEngine, requests: list[Request]) -> torch.Tensor:
-    return engine._decode_logits_eager(requests)
-
-
-@torch.no_grad()
-def graph_logits(engine: InferenceEngine, requests: list[Request]) -> torch.Tensor:
-    decoder = engine.graph_decoder
-    if decoder is None:
-        raise RuntimeError("paged CUDA-graph decoder is not active")
-    logits = decoder.logits(
-        [request.id for request in requests],
-        [request.pos for request in requests],
-        [request.last_token for request in requests],
-    )
-    if logits is None:
-        raise RuntimeError("no CUDA-graph bucket can hold the running batch")
-    return logits
-
-
-@torch.no_grad()
-def direct_eager_logits(
+def decode_logits(
     engine: InferenceEngine,
     requests: list[Request],
 ) -> torch.Tensor:
-    decoder = engine.graph_decoder
-    if decoder is None:
-        raise RuntimeError("paged CUDA-graph decoder is not active")
-    running = len(requests)
-    bucket = decoder.bucket_for(running)
-    if bucket is None:
-        raise RuntimeError("no direct-paged bucket can hold the running batch")
-    if bucket not in decoder.graphs:
-        decoder.capture(bucket)
-    buffers = decoder.bufs[bucket]
-    decoder._fill_for_decode(
-        buffers,
-        bucket,
+    return engine.decoder.logits(
         [request.id for request in requests],
         [request.pos for request in requests],
         [request.last_token for request in requests],
     )
-    return decoder._run_layers(buffers, bucket)[:running].clone()
 
 
 def benchmark_ms(fn, *, warmup: int, rep: int) -> float:
@@ -219,12 +187,22 @@ def main() -> None:
     tokenizer = Tokenizer.from_pretrained(args.model_id)
     model = build_model(args.model_id)
 
-    print("Building paged eager engine...")
+    print("Building gathered SDPA reference engine...")
+    gathered = build_engine(
+        model,
+        max_running=max_running,
+        max_seq_len=max_seq_len,
+        block_size=args.block_size,
+        use_triton=False,
+        use_cuda_graphs=False,
+    )
+    print("Building direct paged Triton eager engine...")
     eager = build_engine(
         model,
         max_running=max_running,
         max_seq_len=max_seq_len,
         block_size=args.block_size,
+        use_triton=True,
         use_cuda_graphs=False,
     )
     print("Building paged CUDA-graph engine...")
@@ -233,6 +211,7 @@ def main() -> None:
         max_running=max_running,
         max_seq_len=max_seq_len,
         block_size=args.block_size,
+        use_triton=True,
         use_cuda_graphs=True,
     )
 
@@ -250,12 +229,13 @@ def main() -> None:
     rows: list[dict[str, float | int]] = []
     for batch_size in args.batch_sizes:
         prompts = build_english_prompts(tokenizer, batch_size, args.context_len)
+        gathered_requests = make_steady_requests(gathered, prompts)
         eager_requests = make_steady_requests(eager, prompts)
         graph_requests = make_steady_requests(graph, prompts)
 
-        expected = eager_logits(eager, eager_requests)
-        direct = direct_eager_logits(graph, graph_requests)
-        actual = graph_logits(graph, graph_requests)
+        expected = decode_logits(gathered, gathered_requests)
+        direct = decode_logits(eager, eager_requests)
+        actual = decode_logits(graph, graph_requests)
         direct_diff = float((expected.float() - direct.float()).abs().max().item())
         graph_diff = float((expected.float() - actual.float()).abs().max().item())
         max_abs_diff = max(direct_diff, graph_diff)
@@ -284,17 +264,17 @@ def main() -> None:
             )
 
         gathered_ms = benchmark_ms(
-            lambda: eager_logits(eager, eager_requests),
+            lambda: decode_logits(gathered, gathered_requests),
             warmup=args.warmup,
             rep=args.rep,
         )
         direct_ms = benchmark_ms(
-            lambda: direct_eager_logits(graph, graph_requests),
+            lambda: decode_logits(eager, eager_requests),
             warmup=args.warmup,
             rep=args.rep,
         )
         graph_ms = benchmark_ms(
-            lambda: graph_logits(graph, graph_requests),
+            lambda: decode_logits(graph, graph_requests),
             warmup=args.warmup,
             rep=args.rep,
         )

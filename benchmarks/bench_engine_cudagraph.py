@@ -1,5 +1,5 @@
 """
-Section 19 benchmark: batched decode — eager ragged SDPA vs CUDA graphs.
+Section 19 benchmark: direct paged Triton decode — eager vs CUDA graphs.
 
 What this measures
 ------------------
@@ -14,10 +14,8 @@ Two regimes, identical work
 For each batch size B we build B requests already advanced to a fixed context
 length (prefilled), then time ONE decode step repeatedly:
 
-  - eager  : InferenceEngine(use_cuda_graphs=False) → ragged SDPA path
-  - graph  : InferenceEngine(use_cuda_graphs=True)  → replay the captured
-             per-batch-size CUDA graph (batch already equals a bucket, so no
-             padding)
+  - eager  : direct page-table Triton forward launched normally
+  - graph  : replay of that exact same forward and kernels
 
 Both run the same 28-layer forward and the same sampling; only the decode
 kernel-launch path differs. We report median per-step latency (ms), the
