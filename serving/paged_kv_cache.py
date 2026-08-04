@@ -269,6 +269,19 @@ class PagedKVCache:
             raise ValueError(f"end_pos must be non-negative, got {end_pos}")
         self._ensure_capacity(request_id, end_pos)
 
+    def write_decode_batch(
+        self,
+        layer_idx: int,
+        physical_blocks: torch.Tensor,
+        block_offsets: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Write one decode token per row into already-resolved physical pages."""
+        self._validate_layer(layer_idx)
+        self.k_cache[layer_idx][physical_blocks, :, block_offsets, :] = k
+        self.v_cache[layer_idx][physical_blocks, :, block_offsets, :] = v
+
     def release_request(self, request_id: int) -> None:
         """Free all physical pages and remove the request's logical block table."""
         self.allocator.release_request(request_id)
