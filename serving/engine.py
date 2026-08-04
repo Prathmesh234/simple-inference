@@ -8,6 +8,17 @@ engine instead runs a *scheduler-driven* loop where the batch is recomposed
 every iteration, so many requests of different lengths share decode steps and
 short ones don't wait behind long ones.
 
+Engine iteration flow
+---------------------
+`step()` intentionally reads like the serving pipeline:
+
+    receive requests through add_request()
+      -> schedule and batch waiting/running requests
+      -> longest-prefix lookup during paged admission
+      -> prefill only unmatched prompt suffixes
+      -> keep the populated per-request KV block table
+      -> optimized ragged decode (CUDA graph when available, eager fallback)
+
 Design choice: reuse, don't rewrite
 -----------------------------------
 Every position-agnostic module of the model is reused verbatim — `embed`, each
@@ -24,43 +35,40 @@ Both phases run over a BATCH of requests — there is no single-request path, ju
 like vLLM. Each iteration runs a batched prefill of any newly admitted requests
 followed by one batched decode of the steady-state requests.
 
-  - PREFILL  (P requests, prompts right-padded to Lmax = max prompt_len): write
-    each request's K/V for positions [0, prompt_len) into its slot, run causal
-    self-attention per row, take each request's LAST REAL position logits → its
-    first token. Padding queries are discarded; the per-row causal mask keeps
-    padding keys unreachable.
+  - PREFILL  (P requests, unmatched prompt suffixes right-padded to Lmax):
+    cached prefix pages stay attached to each request; only positions
+    [cached_prefix_len, prompt_len) are computed and written. The last real
+    suffix position produces the first generated token.
   - DECODE   (R requests, T = 1 each, but every request at a DIFFERENT absolute
     position): write each request's single new K/V at its own position into its
     own KV-cache slot, then attend over the fixed cache with each row's position
     supplied to the kernel. This "ragged" step is the heart of continuous batching.
 
-KV cache as a slot pool
------------------------
-We reuse the Section-11 KVCache, but address it by SLOT (one row per running
-request) instead of treating the batch dim as "the current sequence". A request
-holds slot s for its lifetime; row s of the cache is its private history. When
-the request finishes, the scheduler hands slot s to the next waiting request.
+Paged KV cache
+--------------
+The production path uses `PagedKVCache`: each request owns a logical block table
+whose entries point into one shared physical K/V page pool. Scheduler slots only
+limit admission; request IDs address paged cache state.
 
-With `USE_TRITON=true`, prefill uses the custom variable-length FlashAttention
-kernel and decode uses the fixed-cache custom kernel with one position per row.
-`USE_TRITON=false` retains PyTorch SDPA as the correctness fallback.
+With `USE_TRITON=true`, decode always uses direct physical-page reads through
+`attention_paged_decode_triton`. CUDA graphs capture that exact forward; turning
+graphs off runs it eagerly. `USE_TRITON=false` retains gathered PyTorch SDPA as
+the correctness fallback.
 
 Optional CUDA graphs for decode (Section 19)
 --------------------------------------------
 When `use_cuda_graphs` is set, the *decode* step is captured into per-batch-size
 CUDA graphs and replayed, collapsing the ~300 per-token kernel launches into one
 replay. Capture needs fixed shapes, so the ragged batch is bucketed to preset
-sizes (1, 2, 4, … max_running). Contiguous mode pads with a scratch KV row;
-paged mode pads with a scratch physical page and updates fixed-size block-table,
-position, token, and RoPE buffers in place before replay. Prefill stays eager.
+sizes (1, 2, 4, … max_running). Padding rows use a reserved scratch page while
+fixed block-table, position, token, and RoPE buffers are updated before replay.
+Prefill stays eager.
 
 PagedAttention (Section 16)
 ---------------------------
-Each request owns a block table rather than a fixed `max_seq_len` KV row. Eager
-decode gathers pages into a dense temporary before SDPA, prioritizing inspectable
-correctness. CUDA-graph decode instead uses `PagedGraphDecoder` and a Triton
-kernel that follows a fixed GPU block-table buffer directly into physical pages,
-so no gather or dynamic K/V shape appears inside the captured graph.
+Each request owns a block table rather than a fixed `max_seq_len` KV row.
+`PagedDecoder` follows that table directly inside the Triton attention kernel,
+both eagerly and under CUDA-graph replay. Page gather + SDPA is fallback-only.
 """
 
 from __future__ import annotations
@@ -69,31 +77,19 @@ import math
 import os
 
 import torch
-import torch.nn.functional as F
 from torch.profiler import record_function
 
-from model.cuda_graph import BatchedGraphDecoder
-from model.kv_cache import KVCache
 from model.llama import LlamaModel
-from ops.rope import rotate_half
 from sampling import sample
-from serving.paged_cuda_graph import PagedGraphDecoder
-from serving.paged_kv_cache import PagedKVCache, paged_attention_forward
+from serving.paged_decoder import PagedDecoder
+from serving.paged_kv_cache import PagedKVCache
+from serving.prefill import PrefillRunner
 from serving.radix_cache import RadixCache
 from serving.request import Request, RequestState
 from serving.scheduler import Scheduler
 
-# Capture the batched decode step into per-batch-size CUDA graphs and replay
-# them, collapsing the ~300 per-token kernel launches into one replay (the main
-# driver of memory-bound decode's CPU overhead). Prefill stays eager. Defaults
-# off; toggle with the same USE_CUDA_GRAPHS env var the single-stream path uses.
 USE_CUDA_GRAPHS = os.environ.get("USE_CUDA_GRAPHS", "false").lower() in ("1", "true", "yes", "on")
 USE_TRITON_ATTENTION = os.environ.get("USE_TRITON", "true").lower() in ("1", "true", "yes", "on")
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """RoPE on x (B, T, H, D). cos/sin broadcastable to (B, T, 1, D)."""
-    return x * cos + rotate_half(x) * sin
 
 
 class InferenceEngine:
@@ -111,7 +107,7 @@ class InferenceEngine:
         top_p: float = 1.0,
         warmup: bool = True,
         use_cuda_graphs: bool | None = None,
-        use_paged_attention: bool | None = None,
+        use_triton: bool | None = None,
         use_prefix_cache: bool = False,
         prefix_cache_blocks: int | None = None,
     ):
@@ -121,9 +117,8 @@ class InferenceEngine:
             max_running:  max concurrent requests admitted by the scheduler.
             max_seq_len:  maximum prompt + generated tokens for one request.
             block_size:   tokens per physical KV page in paged mode.
-            num_kv_blocks: physical page-pool size. Defaults to the old
-                          contiguous cache capacity, leaving callers free to
-                          raise max_running independently.
+            num_kv_blocks: physical page-pool size. Defaults to
+                          max_running * pages_per_max_length_request.
             token_budget: soft cap on Σ context tokens admitted per step
                           (defaults to max_running * max_seq_len = no extra cap).
             eos_id:       stop token (defaults to model.cfg.eos_token_id).
@@ -133,9 +128,8 @@ class InferenceEngine:
             use_cuda_graphs: capture the batched decode into per-batch-size CUDA
                           graphs and replay them (eager prefill unchanged).
                           Defaults to the USE_CUDA_GRAPHS env var.
-            use_paged_attention: use page tables. Eager decode gathers into
-                          SDPA; CUDA-graph decode reads pages directly from a
-                          fixed GPU block-table buffer. Defaults to True.
+            use_triton: use the direct paged Triton decode kernel. False keeps
+                          gathered PyTorch SDPA as a correctness fallback.
             use_prefix_cache: reuse complete paged KV blocks through a radix
                           tree and prefill only the unmatched prompt suffix.
             prefix_cache_blocks: maximum KV pages pinned by the radix cache.
@@ -153,15 +147,26 @@ class InferenceEngine:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
-        self.use_cuda_graphs = USE_CUDA_GRAPHS if use_cuda_graphs is None else use_cuda_graphs
-        self.use_paged_attention = (
-            True if use_paged_attention is None else use_paged_attention
+        requested_graphs = (
+            USE_CUDA_GRAPHS if use_cuda_graphs is None else use_cuda_graphs
+        )
+        requested_triton = (
+            USE_TRITON_ATTENTION if use_triton is None else use_triton
+        )
+        self.use_triton = requested_triton and self.device.type == "cuda"
+        self.use_cuda_graphs = (
+            requested_graphs
+            and self.use_triton
+            and self.device.type == "cuda"
         )
         self.use_prefix_cache = use_prefix_cache
-        if self.use_prefix_cache and not self.use_paged_attention:
-            raise ValueError("prefix caching requires paged attention")
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got {block_size}")
+        if requested_graphs and not self.use_cuda_graphs:
+            print(
+                "[engine] CUDA graphs require CUDA + Triton; "
+                "using gathered SDPA fallback."
+            )
 
         self.n_heads_q = self.cfg.num_attention_heads
         self.n_heads_kv = self.cfg.num_key_value_heads
@@ -172,32 +177,20 @@ class InferenceEngine:
         self.scheduler = Scheduler(max_running=max_running, token_budget=budget)
 
         self.block_size = block_size
-        if self.use_paged_attention:
-            default_blocks = max_running * math.ceil(max_seq_len / block_size)
-            self.num_kv_blocks = num_kv_blocks if num_kv_blocks is not None else default_blocks
-            self.kv = PagedKVCache(
-                n_layers=self.cfg.num_hidden_layers,
-                num_blocks=self.num_kv_blocks,
-                block_size=block_size,
-                n_heads_kv=self.n_heads_kv,
-                head_dim=self.head_dim,
-                num_scratch_blocks=1 if self.use_cuda_graphs else 0,
-                dtype=self.dtype,
-                device=self.device,
-            )
-        else:
-            self.num_kv_blocks = None
-            # One KV-cache row per slot. Reuses the Section-11 cache verbatim;
-            # CUDA graphs reserve one extra scratch row for padding.
-            self.kv = KVCache(
-                n_layers=self.cfg.num_hidden_layers,
-                max_batch=max_running + (1 if self.use_cuda_graphs else 0),
-                max_seq_len=max_seq_len,
-                n_heads_kv=self.n_heads_kv,
-                head_dim=self.head_dim,
-                dtype=self.dtype,
-                device=self.device,
-            )
+        default_blocks = max_running * math.ceil(max_seq_len / block_size)
+        self.num_kv_blocks = (
+            num_kv_blocks if num_kv_blocks is not None else default_blocks
+        )
+        self.kv = PagedKVCache(
+            n_layers=self.cfg.num_hidden_layers,
+            num_blocks=self.num_kv_blocks,
+            block_size=block_size,
+            n_heads_kv=self.n_heads_kv,
+            head_dim=self.head_dim,
+            num_scratch_blocks=1 if self.use_cuda_graphs else 0,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         if self.use_prefix_cache:
             cache_blocks = (
@@ -209,32 +202,23 @@ class InferenceEngine:
         else:
             self.prefix_cache = None
 
-        # Lazily-captured per-batch-size decode graphs (captured on first use of
-        # each bucket, or all at once in warmup()). None when graphs are off.
-        # Takes primitives — not `self` — so model/ stays free of serving/ imports.
-        if self.use_cuda_graphs and self.use_paged_attention:
-            self.graph_decoder = PagedGraphDecoder(
-                model,
-                self.kv,
-                max_running=max_running,
-                max_seq_len=max_seq_len,
-                n_heads_q=self.n_heads_q,
-                n_heads_kv=self.n_heads_kv,
-                head_dim=self.head_dim,
-                kv_groups=self.kv_groups,
-            )
-        elif self.use_cuda_graphs:
-            self.graph_decoder = BatchedGraphDecoder(
-                model,
-                self.kv,
-                max_running=max_running,
-                n_heads_q=self.n_heads_q,
-                n_heads_kv=self.n_heads_kv,
-                head_dim=self.head_dim,
-                kv_groups=self.kv_groups,
-            )
-        else:
-            self.graph_decoder = None
+        self.prefill = PrefillRunner(
+            model,
+            self.kv,
+            self.prefix_cache,
+        )
+
+        self.decoder = PagedDecoder(
+            model,
+            self.kv,
+            max_running=max_running,
+            max_seq_len=max_seq_len,
+            n_heads_q=self.n_heads_q,
+            n_heads_kv=self.n_heads_kv,
+            head_dim=self.head_dim,
+            use_triton=self.use_triton,
+            use_cuda_graphs=self.use_cuda_graphs,
+        )
 
         if warmup:
             self.warmup()
@@ -254,13 +238,14 @@ class InferenceEngine:
                 f"prompt_len ({len(prompt_tokens)}) + max_new_tokens ({max_new_tokens}) "
                 f"> max_seq_len ({self.max_seq_len})"
             )
-        if self.use_paged_attention:
-            required_blocks = self.kv.blocks_for_tokens(len(prompt_tokens) + max_new_tokens)
-            if required_blocks > self.kv.num_blocks:
-                raise ValueError(
-                    "request needs more KV blocks than the entire paged cache: "
-                    f"{required_blocks} > {self.kv.num_blocks}"
-                )
+        required_blocks = self.kv.blocks_for_tokens(
+            len(prompt_tokens) + max_new_tokens
+        )
+        if required_blocks > self.kv.num_blocks:
+            raise ValueError(
+                "request needs more KV blocks than the entire paged cache: "
+                f"{required_blocks} > {self.kv.num_blocks}"
+            )
         vocab = self.cfg.vocab_size
         if any(t < 0 or t >= vocab for t in prompt_tokens):
             raise ValueError("prompt contains out-of-range token ids")
@@ -270,6 +255,14 @@ class InferenceEngine:
 
     def has_work(self) -> bool:
         return self.scheduler.has_work()
+
+    @property
+    def cuda_graphs_active(self) -> bool:
+        return self.decoder.use_cuda_graphs
+
+    @property
+    def decode_backend(self) -> str:
+        return self.decoder.backend
 
     def reset(self) -> None:
         """Drop all queued/running requests and reclaim every slot (pristine state)."""
@@ -304,19 +297,15 @@ class InferenceEngine:
         while self.has_work() and iters < max_iters:
             self.step()
             iters += 1
-        if self.graph_decoder is not None:
+        if self.decoder.use_cuda_graphs:
             try:
-                self.graph_decoder.capture_all()
+                self.decoder.capture_all()
             except Exception as e:  # noqa: BLE001 — capture is fragile; degrade safely
-                # CUDA-graph capture is driver/arch/memory-dependent and can fail
-                # (e.g. capture-unsafe op, OOM on the static buffers). A failure
-                # here must NOT kill the engine: drop the graph decoder so every
-                # decode runs the eager custom-kernel path instead.
                 print(
                     f"[engine] CUDA-graph capture failed ({type(e).__name__}: {e}); "
                     f"falling back to eager decode."
                 )
-                self.graph_decoder = None
+                self.decoder.disable_cuda_graphs()
                 self.use_cuda_graphs = False
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
@@ -327,53 +316,68 @@ class InferenceEngine:
         """
         Run one engine iteration.
 
+        Lifecycle:
+          1. Evict finished requests and admit new requests.
+          2. During paged admission, look up the longest cached prefix and
+             attach any matching physical KV pages.
+          3. Prefill only each new request's unmatched prompt suffix.
+          4. Decode one token for requests that were already in DECODE state.
+
         Returns a dict {request_id: new_token_id} for every request that emitted
         a token this iteration (prefilled requests emit their first token; decode
         requests emit their next).
         """
-        with record_function("engine.schedule"):
-            # Release page capacity before FCFS admission so a completed
-            # request can make room for the next waiting request immediately.
-            evicted = self.scheduler.evict_finished()
-            if self.use_paged_attention:
-                for req in evicted:
-                    self.kv.release_request(req.id)
-                self.scheduler.admit(can_admit=self._reserve_pages)
-            else:
-                self.scheduler.admit()
-
+        prefill_reqs, decode_reqs = self._schedule_iteration()
         emitted: dict[int, int] = {}
+
+        if prefill_reqs:
+            with record_function("engine.prefill_batch"):
+                tokens = self._prefill_unmatched_suffixes(prefill_reqs)
+            emitted.update(
+                (request.id, token)
+                for request, token in zip(prefill_reqs, tokens)
+            )
+
+        if decode_reqs:
+            with record_function("engine.decode_batch"):
+                tokens = self._decode_batch(decode_reqs)
+            emitted.update(
+                (request.id, token)
+                for request, token in zip(decode_reqs, tokens)
+            )
+
+        return emitted
+
+    def _schedule_iteration(self) -> tuple[list[Request], list[Request]]:
+        """
+        Evict completed work, admit FCFS requests, and form this iteration's
+        prefill and decode groups.
+
+        Prefix lookup is part of paged admission because shared pages reduce the
+        number of new blocks a request must reserve.
+        """
+        with record_function("engine.schedule"):
+            evicted = self.scheduler.evict_finished()
+            for req in evicted:
+                self.kv.release_request(req.id)
+            self.scheduler.admit(can_admit=self._reserve_paged_request)
 
         # Snapshot steady-state decoders BEFORE prefill flips newly-admitted
         # requests to DECODE — otherwise a just-prefilled request would also be
-        # decoded this same step and emit two tokens at once. Also defensively
-        # retire any request that would write past the KV cache (should never
-        # happen given add_request's check, but never index out of bounds).
+        # decoded this same step and emit two tokens at once.
         decode_reqs: list[Request] = []
-        for r in self.scheduler.running:
-            if r.state is RequestState.DECODE:
-                if r.pos >= self.max_seq_len:
-                    r.state = RequestState.FINISHED
+        for request in self.scheduler.running:
+            if request.state is RequestState.DECODE:
+                if request.pos >= self.max_seq_len:
+                    request.state = RequestState.FINISHED
                 else:
-                    decode_reqs.append(r)
-
-        # 1. Batched prefill of all newly admitted requests (variable prompt
-        #    lengths are padded to the batch max; padding queries are discarded).
-        prefill_reqs = [r for r in self.scheduler.running if r.state is RequestState.PREFILL]
-        if prefill_reqs:
-            with record_function("engine.prefill_batch"):
-                toks = self._prefill_batch(prefill_reqs)
-            for req, tok in zip(prefill_reqs, toks):
-                emitted[req.id] = tok
-
-        # 2. One ragged decode over every request already in steady state.
-        if decode_reqs:
-            with record_function("engine.decode_batch"):
-                toks = self._decode_batch(decode_reqs)
-            for req, tok in zip(decode_reqs, toks):
-                emitted[req.id] = tok
-
-        return emitted
+                    decode_reqs.append(request)
+        prefill_reqs = [
+            request
+            for request in self.scheduler.running
+            if request.state is RequestState.PREFILL
+        ]
+        return prefill_reqs, decode_reqs
 
     def run(self) -> dict[int, Request]:
         """Drive steps until all queued requests finish; return them by id."""
@@ -386,298 +390,121 @@ class InferenceEngine:
             self.step()
         return seen
 
-    # ── prefill (batched, padded) ─────────────────────────────────────────
+    # ── prefix lookup and paged admission ─────────────────────────────────
 
-    def _prefill_batch(self, reqs: list[Request]) -> list[int]:
+    def _reserve_paged_request(self, request: Request) -> bool:
         """
-        Prefill a batch of requests in ONE forward pass. Prefix-cache hits begin
-        at their first unmatched token; misses begin at zero. The suffixes are
-        right-padded to `Lmax`, and padding-query outputs are discarded.
-
-        Each request's first token is sampled from its LAST REAL prompt position.
+        Attach a cached prefix, if present, then reserve blocks for the
+        unmatched prompt suffix and future decode tokens.
         """
-        R = len(reqs)
-        starts = [r.cached_prefix_len for r in reqs]
-        suffix_lens = [r.prompt_len - start for r, start in zip(reqs, starts)]
-        if min(suffix_lens) < 1:
-            raise RuntimeError("prefix cache must leave at least one token for prefill")
-        total_lens = [r.prompt_len for r in reqs]
-        Lmax = max(suffix_lens)
-        device = self.device
-
-        # Right-pad only the uncached suffix. Cached complete pages already hold
-        # K/V for [0, start), so this forward computes [start, prompt_len).
-        ids = torch.zeros(R, Lmax, dtype=torch.long, device=device)
-        for row, (req, start, suffix_len) in enumerate(
-            zip(reqs, starts, suffix_lens)
-        ):
-            ids[row, :suffix_len] = torch.tensor(
-                req.prompt_tokens[start:],
-                dtype=torch.long,
-                device=device,
-            )
-
-        slots = torch.tensor([r.slot for r in reqs], dtype=torch.long, device=device)
-        h = self.model.embed(ids)  # (R, Lmax, hidden)
-        query_positions = (
-            torch.tensor(starts, dtype=torch.long, device=device).view(R, 1)
-            + torch.arange(Lmax, device=device).view(1, Lmax)
+        max_tokens = request.prompt_len + request.max_new_tokens
+        shared_block_ids, cached_tokens = self._match_cached_prefix(request)
+        required_new_blocks = (
+            self.kv.blocks_for_tokens(max_tokens) - len(shared_block_ids)
         )
-        for row, suffix_len in enumerate(suffix_lens):
-            query_positions[row, suffix_len:] = starts[row]
-        cos = (
-            self.model.rope_freqs.cos[query_positions]
-            .to(self.dtype)
-            .view(R, Lmax, 1, self.head_dim)
-        )
-        sin = (
-            self.model.rope_freqs.sin[query_positions]
-            .to(self.dtype)
-            .view(R, Lmax, 1, self.head_dim)
-        )
-
-        for layer in self.model.layers:
-            h = self._attn_prefill(
-                h,
-                layer,
-                reqs,
-                starts,
-                suffix_lens,
-                total_lens,
-                slots,
-                Lmax,
-                query_positions,
-                cos,
-                sin,
-                R,
-            )
-            h = h + layer.mlp(layer.mlp_norm(h))
-
-        # Gather each request's last real suffix position.
-        last_idx = torch.tensor(
-            [length - 1 for length in suffix_lens],
-            dtype=torch.long,
-            device=device,
-        )
-        h_last = h[torch.arange(R, device=device), last_idx]   # (R, hidden)
-        h_last = self.model.norm(h_last.unsqueeze(1))          # (R, 1, hidden)
-        logits = self.model.head(h_last)[:, -1, :]             # (R, vocab)
-        toks = self._sample(logits).tolist()
 
         if self.prefix_cache is not None:
-            for req in reqs:
-                self.prefix_cache.insert(
-                    req.prompt_tokens,
-                    self.kv.block_tables[req.id],
-                )
+            if not self.prefix_cache.evict_until_available(
+                required_new_blocks,
+                protected_block_ids=set(shared_block_ids),
+            ):
+                return False
+        elif not self.kv.can_reserve(request.id, max_tokens):
+            return False
 
-        for req, tok in zip(reqs, toks):
-            req.pos = req.prompt_len                           # next write goes here
-            req.generated.append(tok)
-            if tok == self.eos_id:
-                req.eos_hit = True
-            req.state = RequestState.FINISHED if req.should_finish() else RequestState.DECODE
-        return toks
-
-    def _attn_prefill(
-        self,
-        h,
-        layer,
-        reqs,
-        starts,
-        suffix_lens,
-        total_lens,
-        slots,
-        Lmax,
-        query_positions,
-        cos,
-        sin,
-        R,
-    ) -> torch.Tensor:
-        attn = layer.attn
-        li = attn.layer_idx
-        x = layer.attn_norm(h)
-        q = F.linear(x, attn.wq).view(R, Lmax, self.n_heads_q, self.head_dim)
-        k = F.linear(x, attn.wk).view(R, Lmax, self.n_heads_kv, self.head_dim)
-        v = F.linear(x, attn.wv).view(R, Lmax, self.n_heads_kv, self.head_dim)
-        q = _apply_rope(q, cos, sin)
-        k = _apply_rope(k, cos, sin)
-
-        qT = q.transpose(1, 2)                                 # (R, Hq, Lmax, D)
-        if self.use_paged_attention:
-            # Padding never gets a page-table entry: each request writes only
-            # its real prompt positions, then gathers its own logical prefix.
-            for row, req in enumerate(reqs):
-                real_length = suffix_lens[row]
-                self.kv.append(
-                    li,
-                    req.id,
-                    starts[row],
-                    k[row, :real_length].transpose(0, 1).contiguous(),
-                    v[row, :real_length].transpose(0, 1).contiguous(),
-                )
-            K, V = self.kv.gather_batch(
-                li,
-                [req.id for req in reqs],
-                total_lens,
-                pad_to=max(total_lens),
+        try:
+            self.kv.reserve_request(
+                request.id,
+                max_tokens,
+                shared_block_ids=shared_block_ids,
+                cached_tokens=cached_tokens,
             )
-            key_lengths = torch.tensor(
-                total_lens,
-                dtype=torch.long,
-                device=self.device,
+        except MemoryError:
+            return False
+        request.cached_prefix_len = cached_tokens
+        return True
+
+    def _match_cached_prefix(self, request: Request) -> tuple[list[int], int]:
+        """Return shared physical pages and the matched complete-token count."""
+        if self.prefix_cache is None:
+            return [], 0
+        match = self.prefix_cache.match(request.prompt_tokens)
+        return match.block_ids, match.token_count
+
+    # ── prefill unmatched prompt suffixes ─────────────────────────────────
+
+    def _prefill_unmatched_suffixes(self, reqs: list[Request]) -> list[int]:
+        """
+        Compute only the tokens not covered by prefix-cache pages.
+
+        Cached prefix pages are already attached to each request's paged block
+        table during admission. This stage right-pads the unmatched suffixes,
+        writes their K/V into the remaining pages, and samples the first token.
+        """
+        tokens = self._sample(self.prefill.logits(reqs)).tolist()
+        self.prefill.publish(reqs)
+        self._finish_prefill(reqs, tokens)
+        return tokens
+
+    def _finish_prefill(self, reqs: list[Request], tokens: list[int]) -> None:
+        """Hand populated KV state to decode and advance request lifecycle."""
+        for request, token in zip(reqs, tokens):
+            request.pos = request.prompt_len
+            request.generated.append(token)
+            if token == self.eos_id:
+                request.eos_hit = True
+            request.state = (
+                RequestState.FINISHED
+                if request.should_finish()
+                else RequestState.DECODE
             )
-            out = paged_attention_forward(qT, K, V, query_positions, key_lengths, self.kv_groups)
-            out = out.transpose(1, 2)
-        else:
-            if any(starts):
-                raise RuntimeError("cached-prefix prefill requires paged attention")
-            # Write each row's K/V into its slot at columns [0, Lmax).
-            self.kv.k_cache[li][slots, :, :Lmax, :] = k.permute(0, 2, 1, 3)
-            self.kv.v_cache[li][slots, :, :Lmax, :] = v.permute(0, 2, 1, 3)
-            K = self.kv.k_cache[li][slots, :, :Lmax, :]
-            V = self.kv.v_cache[li][slots, :, :Lmax, :]
-            if USE_TRITON_ATTENTION and qT.is_cuda:
-                from kernels.attention_kernel import attention_prefill_triton
-                out = attention_prefill_triton(
-                    qT,
-                    K,
-                    V,
-                    causal=True,
-                    return_transposed=True,
-                )
-            else:
-                out = F.scaled_dot_product_attention(
-                    qT, K, V, is_causal=True, enable_gqa=(self.kv_groups > 1)
-                )
-                out = out.transpose(1, 2)
-        out = out.reshape(R, Lmax, self.n_heads_q * self.head_dim)
-        return h + F.linear(out, attn.wo)
 
     # ── decode (ragged batch) ─────────────────────────────────────────────
 
     def _decode_batch(self, reqs: list[Request]) -> list[int]:
         """
-        One decode step over the steady-state requests. Computes next-token
-        logits either by replaying a captured CUDA graph (when enabled and the
-        batch fits a bucket) or by launching the same custom decode kernel
-        eagerly, then samples and advances each request.
+        Consume the KV state handed off by prefill and emit one token per
+        steady-state request.
         """
-        logits = None
-        if self.graph_decoder is not None:
-            positions = [r.pos for r in reqs]
-            last_tokens = [r.last_token for r in reqs]
-            try:
-                # None when the batch is larger than the biggest captured bucket.
-                if self.use_paged_attention:
-                    logits = self.graph_decoder.logits(
-                        [r.id for r in reqs], positions, last_tokens
-                    )
-                else:
-                    logits = self.graph_decoder.logits(
-                        [r.slot for r in reqs], positions, last_tokens
-                    )
-            except Exception as e:  # noqa: BLE001 — never crash a live request
-                # A lazy capture (warmup=False) or replay can still fail at
-                # runtime; permanently drop to eager rather than drop the request.
-                print(
-                    f"[engine] CUDA-graph decode failed ({type(e).__name__}: {e}); "
-                    f"falling back to eager decode."
-                )
-                self.graph_decoder = None
-                self.use_cuda_graphs = False
-                logits = None
-        if logits is None:
-            logits = self._decode_logits_eager(reqs)
+        logits = self._decode_logits_optimized(reqs)
+        tokens = self._sample(logits).tolist()
+        self._finish_decode(reqs, tokens)
+        return tokens
 
-        toks = self._sample(logits).tolist()
-        for req, tok in zip(reqs, toks):
-            req.generated.append(tok)
-            req.pos += 1
-            if tok == self.eos_id:
-                req.eos_hit = True
-            if req.should_finish():
-                req.state = RequestState.FINISHED
-        return toks
-
-    def _decode_logits_eager(self, reqs: list[Request]) -> torch.Tensor:
-        """Eager ragged decode using the same per-row-position kernel as graphs."""
-        R = len(reqs)
-        slots = torch.tensor([r.slot for r in reqs], dtype=torch.long, device=self.device)
-        positions = torch.tensor([r.pos for r in reqs], dtype=torch.long, device=self.device)
-        last = torch.tensor([[r.last_token] for r in reqs], dtype=torch.long, device=self.device)
-
-        h = self.model.embed(last)                   # (R, 1, hidden)
-        cos = self.model.rope_freqs.cos[positions].to(self.dtype).view(R, 1, 1, self.head_dim)
-        sin = self.model.rope_freqs.sin[positions].to(self.dtype).view(R, 1, 1, self.head_dim)
-
-        mask = None
-        Lmax = self.max_seq_len
-        if self.use_paged_attention:
-            # The gathered paged path creates its own per-row causal mask.
-            pass
-        elif not (USE_TRITON_ATTENTION and h.is_cuda):
-            # PyTorch fallback reads only the longest valid prefix and needs an
-            # explicit per-row length mask. The Triton path reads the fixed full
-            # cache and applies positions inside the kernel, matching graph mode.
-            Lmax = int(positions.max().item()) + 1
-            cols = torch.arange(Lmax, device=self.device)
-            allowed = cols[None, :] <= positions[:, None]
-            mask = torch.zeros(R, 1, 1, Lmax, dtype=self.dtype, device=self.device)
-            mask.masked_fill_(~allowed.view(R, 1, 1, Lmax), float("-inf"))
-
-        for layer in self.model.layers:
-            h = self._attn_decode(h, layer, reqs, slots, positions, Lmax, cos, sin, mask, R)
-            h = h + layer.mlp(layer.mlp_norm(h))
-
-        h = self.model.norm(h)
-        return self.model.head(h)[:, -1, :]          # (R, vocab)
-
-    def _attn_decode(self, h, layer, reqs, slots, positions, Lmax, cos, sin, mask, R) -> torch.Tensor:
-        attn = layer.attn
-        li = attn.layer_idx
-        x = layer.attn_norm(h)
-        q = F.linear(x, attn.wq).view(R, 1, self.n_heads_q, self.head_dim)
-        k = F.linear(x, attn.wk).view(R, 1, self.n_heads_kv, self.head_dim)
-        v = F.linear(x, attn.wv).view(R, 1, self.n_heads_kv, self.head_dim)
-        q = _apply_rope(q, cos, sin)
-        k = _apply_rope(k, cos, sin)
-
-        qT = q.transpose(1, 2)                                   # (R, Hq, 1, D)
-        if self.use_paged_attention:
-            lengths = [req.pos + 1 for req in reqs]
-            for row, req in enumerate(reqs):
-                self.kv.append(
-                    li,
-                    req.id,
-                    req.pos,
-                    k[row, 0].unsqueeze(1).contiguous(),
-                    v[row, 0].unsqueeze(1).contiguous(),
-                )
-            K, V = self.kv.gather_batch(li, [req.id for req in reqs], lengths)
-            out = paged_attention_forward(
-                qT,
-                K,
-                V,
-                positions.view(R, 1),
-                torch.tensor(lengths, dtype=torch.long, device=self.device),
-                self.kv_groups,
+    def _decode_logits_optimized(self, reqs: list[Request]) -> torch.Tensor:
+        """Run paged decode using the configured optimized/fallback backend."""
+        positions = [request.pos for request in reqs]
+        last_tokens = [request.last_token for request in reqs]
+        try:
+            return self.decoder.logits(
+                [request.id for request in reqs],
+                positions,
+                last_tokens,
             )
-        else:
-            # Scatter each row's single new K/V into (slot_r, position_r).
-            self.kv.k_cache[li][slots, :, positions, :] = k[:, 0]
-            self.kv.v_cache[li][slots, :, positions, :] = v[:, 0]
-            K = self.kv.k_cache[li][slots, :, :Lmax, :]
-            V = self.kv.v_cache[li][slots, :, :Lmax, :]
-            if USE_TRITON_ATTENTION and qT.is_cuda:
-                from kernels.attention_kernel import attention_decode_triton
-                out = attention_decode_triton(qT, K, V, positions)
-            else:
-                out = F.scaled_dot_product_attention(
-                    qT, K, V, attn_mask=mask, enable_gqa=(self.kv_groups > 1)
-                )
-        out = out.transpose(1, 2).reshape(R, 1, self.n_heads_q * self.head_dim)
-        return h + F.linear(out, attn.wo)
+        except Exception as e:  # noqa: BLE001 — graph fallback is intentional
+            if not self.decoder.use_cuda_graphs:
+                raise
+            print(
+                f"[engine] CUDA-graph decode failed ({type(e).__name__}: {e}); "
+                "retrying the same direct paged Triton forward eagerly."
+            )
+            self.decoder.disable_cuda_graphs()
+            self.use_cuda_graphs = False
+            return self.decoder.logits(
+                [request.id for request in reqs],
+                positions,
+                last_tokens,
+            )
+
+    def _finish_decode(self, reqs: list[Request], tokens: list[int]) -> None:
+        """Advance positions and retire requests that reached EOS or their cap."""
+        for request, token in zip(reqs, tokens):
+            request.generated.append(token)
+            request.pos += 1
+            if token == self.eos_id:
+                request.eos_hit = True
+            if request.should_finish():
+                request.state = RequestState.FINISHED
 
     # ── sampling ──────────────────────────────────────────────────────────
 
@@ -688,36 +515,3 @@ class InferenceEngine:
             top_k=self.top_k,
             top_p=self.top_p,
         )
-
-    def _reserve_pages(self, req: Request) -> bool:
-        """Admission callback: match, reclaim cache pages, then reserve capacity."""
-        max_tokens = req.prompt_len + req.max_new_tokens
-        shared_block_ids: list[int] = []
-        cached_tokens = 0
-
-        if self.prefix_cache is not None:
-            match = self.prefix_cache.match(req.prompt_tokens)
-            shared_block_ids = match.block_ids
-            cached_tokens = match.token_count
-            required_blocks = (
-                self.kv.blocks_for_tokens(max_tokens) - len(shared_block_ids)
-            )
-            if not self.prefix_cache.evict_until_available(
-                required_blocks,
-                protected_block_ids=set(shared_block_ids),
-            ):
-                return False
-        elif not self.kv.can_reserve(req.id, max_tokens):
-            return False
-
-        try:
-            self.kv.reserve_request(
-                req.id,
-                max_tokens,
-                shared_block_ids=shared_block_ids,
-                cached_tokens=cached_tokens,
-            )
-        except MemoryError:
-            return False
-        req.cached_prefix_len = cached_tokens
-        return True
