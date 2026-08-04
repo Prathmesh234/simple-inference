@@ -25,7 +25,8 @@ Run
     uv run uvicorn serving.server:app --host 0.0.0.0 --port 8000
 
   PagedAttention and CUDA-graph decode are enabled by default. Set
-  `SERVE_USE_CUDA_GRAPHS=false` to compare against eager gathered paging.
+  `SERVE_USE_CUDA_GRAPHS=false` to run the same direct paged Triton forward
+  eagerly instead of through graph replay.
 
   (single worker process only — the model is loaded once in-process; do not run
    uvicorn with --workers > 1.)
@@ -45,7 +46,6 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Optional
 
 import env_loader  # noqa: F401  loads .env (HF_TOKEN, USE_* toggles)
 import torch
@@ -64,27 +64,40 @@ from tokenizer import Tokenizer
 
 # ── server configuration (env-overridable) ─────────────────────────────────
 
-MODEL_ID = os.environ.get("SERVE_MODEL_ID", "meta-llama/Llama-3.2-3B")
-DEVICE = os.environ.get("SERVE_DEVICE", "cuda")
-MAX_RUNNING = int(os.environ.get("SERVE_MAX_RUNNING", "8"))
-MAX_SEQ_LEN = int(os.environ.get("SERVE_MAX_SEQ_LEN", "4096"))
-PAGED_BLOCK_SIZE = int(os.environ.get("SERVE_PAGED_BLOCK_SIZE", "16"))
-_KB = os.environ.get("SERVE_KV_BLOCKS", "")
-NUM_KV_BLOCKS = int(_KB) if _KB else None
-_TB = os.environ.get("SERVE_TOKEN_BUDGET", "")
-TOKEN_BUDGET = int(_TB) if _TB else None
-TEMPERATURE = float(os.environ.get("SERVE_TEMPERATURE", "0.7"))
-TOP_K = int(os.environ.get("SERVE_TOP_K", "50"))
-TOP_P = float(os.environ.get("SERVE_TOP_P", "0.9"))
-DEFAULT_MAX_NEW = int(os.environ.get("SERVE_DEFAULT_MAX_NEW", "128"))
-USE_PAGED_CUDA_GRAPHS = os.environ.get(
-    "SERVE_USE_CUDA_GRAPHS", "true"
-).lower() in ("1", "true", "yes", "on")
-USE_PREFIX_CACHE = os.environ.get(
-    "SERVE_USE_PREFIX_CACHE", "true"
-).lower() in ("1", "true", "yes", "on")
-_PCB = os.environ.get("SERVE_PREFIX_CACHE_BLOCKS", "")
-PREFIX_CACHE_BLOCKS = int(_PCB) if _PCB else None
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name, "")
+    return int(value) if value else None
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    model_id: str = os.environ.get(
+        "SERVE_MODEL_ID",
+        "meta-llama/Llama-3.2-3B",
+    )
+    device: str = os.environ.get("SERVE_DEVICE", "cuda")
+    max_running: int = int(os.environ.get("SERVE_MAX_RUNNING", "8"))
+    max_seq_len: int = int(os.environ.get("SERVE_MAX_SEQ_LEN", "4096"))
+    block_size: int = int(os.environ.get("SERVE_PAGED_BLOCK_SIZE", "16"))
+    num_kv_blocks: int | None = _env_optional_int("SERVE_KV_BLOCKS")
+    token_budget: int | None = _env_optional_int("SERVE_TOKEN_BUDGET")
+    temperature: float = float(os.environ.get("SERVE_TEMPERATURE", "0.7"))
+    top_k: int = int(os.environ.get("SERVE_TOP_K", "50"))
+    top_p: float = float(os.environ.get("SERVE_TOP_P", "0.9"))
+    default_max_new: int = int(os.environ.get("SERVE_DEFAULT_MAX_NEW", "128"))
+    use_cuda_graphs: bool = _env_bool("SERVE_USE_CUDA_GRAPHS", "true")
+    use_prefix_cache: bool = _env_bool("SERVE_USE_PREFIX_CACHE", "true")
+    prefix_cache_blocks: int | None = _env_optional_int(
+        "SERVE_PREFIX_CACHE_BLOCKS"
+    )
+
+
+CONFIG = ServerConfig()
 DTYPE = torch.bfloat16
 
 
@@ -102,7 +115,7 @@ class _Job:
     prompt_ids: list[int]
     max_new_tokens: int
     out: "queue.Queue[tuple[str, object]]" = field(default_factory=queue.Queue)
-    req: Optional[Request] = None
+    req: Request | None = None
 
 
 class _Worker:
@@ -118,7 +131,7 @@ class _Worker:
             max_workers=1,
             thread_name_prefix="engine-worker",
         )
-        self._future: Optional[Future] = None
+        self._future: Future | None = None
 
     def start(self) -> None:
         if self._future is not None:
@@ -215,32 +228,35 @@ state = _State()
 def _load() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to serve this model")
-    print(f"[server] loading tokenizer + model: {MODEL_ID}")
-    state.tokenizer = Tokenizer.from_pretrained(MODEL_ID)
+    print(f"[server] loading tokenizer + model: {CONFIG.model_id}")
+    state.tokenizer = Tokenizer.from_pretrained(CONFIG.model_id)
     cfg = ModelConfig.llama_3_2_3b()
-    loader = WeightLoader.from_pretrained(MODEL_ID)
-    model = LlamaModel(cfg, torch.device(DEVICE))
+    loader = WeightLoader.from_pretrained(CONFIG.model_id)
+    model = LlamaModel(cfg, torch.device(CONFIG.device))
     model.load_weights(loader)
-    model.to(DEVICE, DTYPE)
+    model.to(CONFIG.device, DTYPE)
     model.eval()
 
-    print(f"[server] building engine (max_running={MAX_RUNNING}, max_seq_len={MAX_SEQ_LEN}) + warmup")
+    print(
+        "[server] building engine "
+        f"(max_running={CONFIG.max_running}, max_seq_len={CONFIG.max_seq_len}) "
+        "+ warmup"
+    )
     # warmup=True runs a dummy batched prefill+decode before we serve traffic.
     state.engine = InferenceEngine(
         model=model,
-        max_running=MAX_RUNNING,
-        max_seq_len=MAX_SEQ_LEN,
-        block_size=PAGED_BLOCK_SIZE,
-        num_kv_blocks=NUM_KV_BLOCKS,
-        token_budget=TOKEN_BUDGET,
-        temperature=TEMPERATURE,
-        top_k=TOP_K,
-        top_p=TOP_P,
+        max_running=CONFIG.max_running,
+        max_seq_len=CONFIG.max_seq_len,
+        block_size=CONFIG.block_size,
+        num_kv_blocks=CONFIG.num_kv_blocks,
+        token_budget=CONFIG.token_budget,
+        temperature=CONFIG.temperature,
+        top_k=CONFIG.top_k,
+        top_p=CONFIG.top_p,
         warmup=True,
-        use_cuda_graphs=USE_PAGED_CUDA_GRAPHS,
-        use_paged_attention=True,
-        use_prefix_cache=USE_PREFIX_CACHE,
-        prefix_cache_blocks=PREFIX_CACHE_BLOCKS,
+        use_cuda_graphs=CONFIG.use_cuda_graphs,
+        use_prefix_cache=CONFIG.use_prefix_cache,
+        prefix_cache_blocks=CONFIG.prefix_cache_blocks,
     )
     state.worker = _Worker(state.engine)
     state.worker.start()
@@ -263,7 +279,7 @@ app = FastAPI(title="simple-inference server", lifespan=lifespan)
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    max_new_tokens: int = Field(default=DEFAULT_MAX_NEW, ge=1)
+    max_new_tokens: int = Field(default=CONFIG.default_max_new, ge=1)
 
 
 class GenerateResponse(BaseModel):
@@ -278,11 +294,14 @@ class GenerateResponse(BaseModel):
 def _prepare(body: GenerateRequest) -> _Job:
     """Encode + clamp, returning a submitted-ready job (raises HTTP 400 on bad input)."""
     ids = state.tokenizer.encode(body.prompt, add_bos=True)
-    room = MAX_SEQ_LEN - len(ids)
+    room = CONFIG.max_seq_len - len(ids)
     if room < 1:
         raise HTTPException(
             status_code=400,
-            detail=f"prompt has {len(ids)} tokens; max_seq_len is {MAX_SEQ_LEN}",
+            detail=(
+                f"prompt has {len(ids)} tokens; "
+                f"max_seq_len is {CONFIG.max_seq_len}"
+            ),
         )
     max_new = min(body.max_new_tokens, room)
     return _Job(prompt_ids=ids, max_new_tokens=max_new)
@@ -297,15 +316,22 @@ def health() -> dict:
     sched = eng.scheduler if ready else None
     return {
         "status": "ok" if ready else "loading",
-        "model_id": MODEL_ID,
-        "max_running": MAX_RUNNING,
-        "max_seq_len": MAX_SEQ_LEN,
-        "paged_attention": eng.use_paged_attention if ready else True,
-        "cuda_graphs": eng.graph_decoder is not None if ready else USE_PAGED_CUDA_GRAPHS,
+        "model_id": CONFIG.model_id,
+        "max_running": CONFIG.max_running,
+        "max_seq_len": CONFIG.max_seq_len,
+        "paged_attention": True,
+        "cuda_graphs": (
+            eng.cuda_graphs_active if ready else CONFIG.use_cuda_graphs
+        ),
+        "decode_backend": eng.decode_backend if ready else None,
         "prefix_cache": eng.prefix_cache.stats() if ready and eng.prefix_cache else None,
-        "paged_block_size": PAGED_BLOCK_SIZE,
-        "kv_blocks": eng.num_kv_blocks if ready else NUM_KV_BLOCKS,
-        "sampling": {"temperature": TEMPERATURE, "top_k": TOP_K, "top_p": TOP_P},
+        "paged_block_size": CONFIG.block_size,
+        "kv_blocks": eng.num_kv_blocks if ready else CONFIG.num_kv_blocks,
+        "sampling": {
+            "temperature": CONFIG.temperature,
+            "top_k": CONFIG.top_k,
+            "top_p": CONFIG.top_p,
+        },
         "running": len(sched.running) if sched else 0,
         "waiting": len(sched.waiting) if sched else 0,
     }

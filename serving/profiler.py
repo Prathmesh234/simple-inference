@@ -116,7 +116,8 @@ class ServerProfiler:
             f"max_running={self.engine.max_running}\n"
             f"max_seq_len={self.engine.max_seq_len}\n"
             f"token_budget={self.engine.scheduler.token_budget}\n"
-            f"cuda_graphs={self.engine.use_cuda_graphs}\n"
+            f"decode_backend={self.engine.decode_backend}\n"
+            f"cuda_graphs={self.engine.cuda_graphs_active}\n"
             f"profile_steps={self.active}\n\n"
             f"{table}\n"
         )
