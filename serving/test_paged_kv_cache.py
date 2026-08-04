@@ -12,10 +12,13 @@ import torch
 import torch.nn.functional as F
 
 from config import ModelConfig, RopeScalingConfig
+from iterations.inference_01_contiguous_eager.engine import (
+    InferenceEngine as ContiguousInferenceEngine,
+)
 from model.llama import LlamaModel
 from serving.block_allocator import BlockAllocator
 from serving.engine import InferenceEngine
-from serving.paged_cuda_graph import PagedDecodeBuffers, PagedGraphDecoder
+from serving.paged_decoder import PagedDecodeBuffers, PagedDecoder
 from serving.paged_kv_cache import PagedKVCache, paged_attention_forward
 from serving.radix_cache import RadixCache
 
@@ -121,6 +124,37 @@ class RadixCacheTest(unittest.TestCase):
         cache.release_request(2)
         self.assertEqual(cache.allocator.free_blocks, 6)
 
+    def test_newer_path_evicts_old_prefix_and_forces_a_miss(self) -> None:
+        cache = PagedKVCache(
+            n_layers=1,
+            num_blocks=4,
+            block_size=2,
+            n_heads_kv=1,
+            head_dim=2,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        radix = RadixCache(cache, max_blocks=2)
+
+        old_tokens = [1, 2, 3, 4]
+        cache.reserve_request(request_id=1, max_tokens=4)
+        old_values = torch.arange(8, dtype=torch.float32).view(1, 4, 2)
+        cache.append(0, 1, 0, old_values, old_values)
+        radix.insert(old_tokens, cache.block_tables[1])
+        cache.release_request(1)
+
+        new_tokens = [9, 9, 8, 8]
+        cache.reserve_request(request_id=2, max_tokens=4)
+        new_values = old_values + 100
+        cache.append(0, 2, 0, new_values, new_values)
+        radix.insert(new_tokens, cache.block_tables[2])
+        cache.release_request(2)
+
+        self.assertEqual(radix.match(old_tokens + [5]).token_count, 0)
+        self.assertEqual(radix.match(new_tokens + [7]).token_count, 4)
+        self.assertEqual(radix.stats()["evictions"], 2)
+        self.assertEqual(cache.allocator.free_blocks, 2)
+
 
 class PagedAttentionTest(unittest.TestCase):
     def test_masked_gathered_attention_matches_per_request_sdpa(self) -> None:
@@ -185,11 +219,16 @@ class PagedEngineTest(unittest.TestCase):
         )
         paged = InferenceEngine(
             **common,
-            use_paged_attention=True,
             block_size=2,
             num_kv_blocks=8,
         )
-        contiguous = InferenceEngine(**common, use_paged_attention=False)
+        contiguous = ContiguousInferenceEngine(
+            model=model,
+            max_running=2,
+            max_seq_len=8,
+            temperature=0.0,
+            warmup=False,
+        )
         prompts = ([1, 4, 6], [1, 5])
 
         paged_reqs = [paged.add_request(list(prompt), max_new_tokens=3) for prompt in prompts]
@@ -216,7 +255,6 @@ class PagedEngineTest(unittest.TestCase):
             temperature=0.0,
             warmup=False,
             use_cuda_graphs=False,
-            use_paged_attention=True,
         )
         first = engine.add_request([1, 4, 6], max_new_tokens=1)
         second = engine.add_request([1, 5, 7], max_new_tokens=1)
@@ -242,7 +280,6 @@ class PagedEngineTest(unittest.TestCase):
             temperature=0.0,
             warmup=False,
             use_cuda_graphs=False,
-            use_paged_attention=True,
         )
         cached = InferenceEngine(
             **common,
@@ -278,7 +315,7 @@ class PagedEngineTest(unittest.TestCase):
         cache.reserve_request(request_id=10, max_tokens=4)
         values = torch.ones(1, 3, 4)
         cache.append(0, 10, 0, values, values)
-        decoder = PagedGraphDecoder(
+        decoder = PagedDecoder(
             model,
             cache,
             max_running=2,
@@ -286,19 +323,20 @@ class PagedEngineTest(unittest.TestCase):
             n_heads_q=2,
             n_heads_kv=1,
             head_dim=4,
-            kv_groups=2,
+            use_triton=True,
+            use_cuda_graphs=True,
         )
         bufs = PagedDecodeBuffers(
-            B=2,
+            batch_size=2,
             max_blocks=decoder.max_blocks,
             head_dim=4,
             dtype=torch.float32,
             device=torch.device("cpu"),
         )
         table_ptr = bufs.block_tables.data_ptr()
-        decoder._fill_for_decode(
+        decoder._fill(
             bufs,
-            B=2,
+            batch_size=2,
             request_ids=[10],
             positions=[3],
             last_tokens=[7],

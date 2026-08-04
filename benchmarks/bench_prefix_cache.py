@@ -112,7 +112,6 @@ def build_engine(
         temperature=0.0,
         warmup=False,
         use_cuda_graphs=False,
-        use_paged_attention=True,
         use_prefix_cache=use_prefix_cache,
     )
 
